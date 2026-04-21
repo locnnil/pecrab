@@ -6,7 +6,21 @@ pub mod models;
 
 mod errors;
 
-use crate::errors::EngineError;
+use crate::{errors::EngineError, models::TransactionInfo};
+
+use csv::{ReaderBuilder, Trim};
+use std::io::Read;
+
+pub fn parse_transactions<R: Read>(
+    reader: R,
+) -> impl Iterator<Item = Result<TransactionInfo, EngineError>> {
+    ReaderBuilder::new()
+        .flexible(true)
+        .trim(Trim::All)
+        .from_reader(reader)
+        .into_deserialize()
+        .map(|result| result.map_err(Into::into))
+}
 
 /// Resolves the CSV file path from an optional CLI argument.
 fn parse_file_path(arg: Option<String>) -> Result<String, EngineError> {
@@ -23,9 +37,18 @@ pub fn run_with_path(file_path: &str) -> Result<(), EngineError> {
         File::open(file_path).map_err(|err| EngineError::FileError { source: err })?,
     );
 
-    println!("File opened successfully, starting to process transactions...");
-    dbg!("buffer: {:#?}", buff);
+    for result in parse_transactions(buff) {
+        match result {
+            Ok(tx) => {
+                println!("Processing transaction: {:#?}", tx);
+            }
+            Err(e) => {
+                eprintln!("skipping unparseable row: {e}");
+            }
+        }
+    }
 
+    println!("File opened successfully, transactions readed...");
     Ok(())
 }
 
