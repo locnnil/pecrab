@@ -376,3 +376,260 @@ fn require_amount(event: &TransactionInfo) -> Result<Decimal> {
         ),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn deposit(client: u16, tx: u32, amount: Decimal) -> TransactionInfo {
+        TransactionInfo {
+            type_tx: TransactionType::Deposit,
+            client,
+            tx,
+            amount: Some(amount),
+        }
+    }
+
+    fn withdrawal(client: u16, tx: u32, amount: Decimal) -> TransactionInfo {
+        TransactionInfo {
+            type_tx: TransactionType::Withdrawal,
+            client,
+            tx,
+            amount: Some(amount),
+        }
+    }
+
+    fn dispute(client: u16, tx: u32) -> TransactionInfo {
+        TransactionInfo {
+            type_tx: TransactionType::Dispute,
+            client,
+            tx,
+            amount: None,
+        }
+    }
+
+    fn resolve(client: u16, tx: u32) -> TransactionInfo {
+        TransactionInfo {
+            type_tx: TransactionType::Resolve,
+            client,
+            tx,
+            amount: None,
+        }
+    }
+
+    fn chargeback(client: u16, tx: u32) -> TransactionInfo {
+        TransactionInfo {
+            type_tx: TransactionType::Chargeback,
+            client,
+            tx,
+            amount: None,
+        }
+    }
+
+    fn accounts_map(engine: Payments) -> HashMap<u16, Account> {
+        engine.accounts().map(|a| (a.client, a)).collect()
+    }
+
+    // -- Deposit -------------------------------------------------------------
+
+    #[test]
+    fn deposit_creates_account_and_credits_available() {
+        let mut e = Payments::new();
+        e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
+
+        let accounts = accounts_map(e);
+        let acc = &accounts[&1];
+        assert_eq!(acc.available, dec!(100.0000));
+        assert_eq!(acc.held, dec!(0));
+        assert_eq!(acc.total, dec!(100.0000));
+        assert!(!acc.locked);
+    }
+
+    #[test]
+    fn duplicate_tx_id_is_ignored() {
+        let mut e = Payments::new();
+        e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
+        e.apply(deposit(1, 1, dec!(50.0000))).unwrap(); // same tx ID
+
+        let accounts = accounts_map(e);
+        assert_eq!(accounts[&1].available, dec!(100.0000));
+    }
+
+    // -- Withdrawal ----------------------------------------------------------
+
+    #[test]
+    fn withdrawal_debits_available() {
+        let mut e = Payments::new();
+        e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
+        e.apply(withdrawal(1, 2, dec!(40.0000))).unwrap();
+
+        let accounts = accounts_map(e);
+        assert_eq!(accounts[&1].available, dec!(60.0000));
+        assert_eq!(accounts[&1].total, dec!(60.0000));
+    }
+
+    #[test]
+    fn withdrawal_fails_silently_on_insufficient_funds() {
+        let mut e = Payments::new();
+        e.apply(deposit(1, 1, dec!(10.0000))).unwrap();
+        e.apply(withdrawal(1, 2, dec!(20.0000))).unwrap(); // exceeds available
+
+        let accounts = accounts_map(e);
+        assert_eq!(accounts[&1].available, dec!(10.0000)); // unchanged
+    }
+
+    // -- Dispute -------------------------------------------------------------
+
+    #[test]
+    fn dispute_moves_funds_to_held() {
+        let mut e = Payments::new();
+        e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
+        e.apply(dispute(1, 1)).unwrap();
+
+        let accounts = accounts_map(e);
+        let acc = &accounts[&1];
+        assert_eq!(acc.available, dec!(0.0));
+        assert_eq!(acc.held, dec!(100.0));
+        assert_eq!(acc.total, dec!(100.0));
+    }
+
+    #[test]
+    fn dispute_with_insufficient_available_is_ignored() {
+        let mut e = Payments::new();
+        e.apply(deposit(1, 1, dec!(100.0))).unwrap();
+        e.apply(withdrawal(1, 2, dec!(100.0))).unwrap(); // drain available
+        e.apply(dispute(1, 1)).unwrap(); // available < deposit amount → ignored
+
+        let accounts = accounts_map(e);
+        let acc = &accounts[&1];
+        assert_eq!(acc.available, dec!(0.0));
+        assert_eq!(acc.held, dec!(0.0));
+        assert!(!acc.locked);
+    }
+
+    #[test]
+    fn dispute_unknown_tx_is_ignored() {
+        let mut e = Payments::new();
+        e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
+        e.apply(dispute(1, 99)).unwrap(); // tx 99 does not exist
+
+        let accounts = accounts_map(e);
+        assert_eq!(accounts[&1].available, dec!(100.0000));
+        assert_eq!(accounts[&1].held, dec!(0.0000));
+    }
+
+    #[test]
+    fn dispute_cross_client_is_ignored() {
+        let mut e = Payments::new();
+        e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
+        e.apply(dispute(2, 1)).unwrap(); // client 2 tries to dispute client 1's tx
+
+        let accounts = accounts_map(e);
+        assert_eq!(accounts[&1].available, dec!(100.0000));
+        assert_eq!(accounts[&1].held, dec!(0.0000));
+    }
+
+    // -- Resolve -------------------------------------------------------------
+
+    #[test]
+    fn resolve_moves_held_back_to_available() {
+        let mut e = Payments::new();
+        e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
+        e.apply(dispute(1, 1)).unwrap();
+        e.apply(resolve(1, 1)).unwrap();
+
+        let accounts = accounts_map(e);
+        let acc = &accounts[&1];
+        assert_eq!(acc.available, dec!(100.0000));
+        assert_eq!(acc.held, dec!(0.0000));
+        assert_eq!(acc.total, dec!(100.0000));
+    }
+
+    #[test]
+    fn resolve_on_undisputed_tx_is_ignored() {
+        let mut e = Payments::new();
+        e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
+        e.apply(resolve(1, 1)).unwrap(); // not disputed
+
+        let accounts = accounts_map(e);
+        assert_eq!(accounts[&1].available, dec!(100.0000));
+        assert_eq!(accounts[&1].held, dec!(0.0000));
+    }
+
+    // -- Chargeback ----------------------------------------------------------
+
+    #[test]
+    fn chargeback_deducts_held_and_locks_account() {
+        let mut e = Payments::new();
+        e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
+        e.apply(dispute(1, 1)).unwrap();
+        e.apply(chargeback(1, 1)).unwrap();
+
+        let accounts = accounts_map(e);
+        let acc = &accounts[&1];
+        assert_eq!(acc.available, dec!(0.0000));
+        assert_eq!(acc.held, dec!(0.0000));
+        assert_eq!(acc.total, dec!(0.0000));
+        assert!(acc.locked);
+    }
+
+    #[test]
+    fn chargeback_on_undisputed_tx_is_ignored() {
+        let mut e = Payments::new();
+        e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
+        e.apply(chargeback(1, 1)).unwrap(); // no prior dispute
+
+        let accounts = accounts_map(e);
+        assert!(!accounts[&1].locked);
+        assert_eq!(accounts[&1].total, dec!(100.0000));
+    }
+
+    #[test]
+    fn locked_account_ignores_all_mutations() {
+        let mut e = Payments::new();
+        e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
+        e.apply(dispute(1, 1)).unwrap();
+        e.apply(chargeback(1, 1)).unwrap(); // locks the account
+
+        e.apply(deposit(1, 2, dec!(500.0000))).unwrap(); // should be ignored
+        e.apply(withdrawal(1, 3, dec!(10.0000))).unwrap(); // should be ignored
+
+        let accounts = accounts_map(e);
+        let acc = &accounts[&1];
+        assert_eq!(acc.total, dec!(0.0000));
+        assert!(acc.locked);
+    }
+
+    // -- Multi-client --------------------------------------------------------
+
+    #[test]
+    fn multiple_clients_are_independent() {
+        let mut e = Payments::new();
+        e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
+        e.apply(deposit(2, 2, dec!(200.0000))).unwrap();
+        e.apply(withdrawal(1, 3, dec!(50.0000))).unwrap();
+
+        let accounts = accounts_map(e);
+        assert_eq!(accounts[&1].available, dec!(50.0000));
+        assert_eq!(accounts[&2].available, dec!(200.0000));
+    }
+
+    // -- require_amount ------------------------------------------------------
+
+    #[test]
+    fn deposit_without_amount_returns_err() {
+        let mut e = Payments::new();
+        let result = e.apply(TransactionInfo {
+            type_tx: TransactionType::Deposit,
+            client: 1,
+            tx: 1,
+            amount: None,
+        });
+        assert!(result.is_err());
+    }
+}

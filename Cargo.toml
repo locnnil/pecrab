@@ -7,5 +7,6 @@ edition = "2024"
 anyhow = "1.0.102"
 csv = "1.4.0"
 rust_decimal = "1.41.0"
+rust_decimal_macros = "1.40.0"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
