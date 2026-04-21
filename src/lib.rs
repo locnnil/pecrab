@@ -11,7 +11,7 @@ mod errors;
 use crate::{errors::EngineError, models::TransactionInfo};
 
 use csv::{ReaderBuilder, Trim};
-use std::io::Read;
+use std::io::{Read, Write};
 
 pub fn parse_transactions<R: Read>(
     reader: R,
@@ -32,15 +32,9 @@ fn parse_file_path(arg: Option<String>) -> Result<String, EngineError> {
 }
 
 /// Processes transactions from the CSV file at `file_path`.
-pub fn run_with_path(file_path: &str) -> Result<(), EngineError> {
-    // inside an input file, transactions followed by other transactions are assumed to be
-    // chronologically ordered, so we can process them in a single pass.
-    let buff = BufReader::new(
-        File::open(file_path).map_err(|err| EngineError::FileError { source: err })?,
-    );
-
+pub fn run_with_writer<R: Read, W: Write>(reader: R, writer: W) -> Result<(), EngineError> {
     let mut engine = Payments::new();
-    for result in parse_transactions(buff) {
+    for result in parse_transactions(reader) {
         match result {
             Ok(tx) => {
                 if let Err(e) = engine.apply(tx) {
@@ -53,14 +47,27 @@ pub fn run_with_path(file_path: &str) -> Result<(), EngineError> {
         }
     }
 
-    println!("File opened successfully, transactions readed...");
+    let mut csv_writer = csv::Writer::from_writer(writer);
+    for account in engine.accounts() {
+        csv_writer
+            .serialize(account)
+            .map_err(|e| EngineError::CsvParseError { source: e })?;
+    }
+    csv_writer.flush()?;
+
     Ok(())
 }
 
 /// Runs the payment engine using CLI arguments.
 pub fn run() -> Result<(), EngineError> {
     let file_path = parse_file_path(std::env::args().nth(1))?;
-    run_with_path(&file_path)
+
+    // inside an input file, transactions followed by other transactions are assumed to be
+    // chronologically ordered, so we can process them in a single pass.
+    let buff = BufReader::new(
+        File::open(file_path).map_err(|err| EngineError::FileError { source: err })?,
+    );
+    run_with_writer(buff, std::io::stdout())
 }
 
 #[cfg(test)]
@@ -83,14 +90,16 @@ mod lib_tests {
     fn test_run_with_path_file_exists() {
         let path = "/tmp/pecrab_test_existing.csv";
         std::fs::write(path, "type,client,tx,amount\n").unwrap();
-        let result = run_with_path(path);
+        let file = File::open(path).unwrap();
+        let result = run_with_writer(BufReader::new(file), std::io::sink());
         std::fs::remove_file(path).unwrap();
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_run_with_path_file_not_found() {
-        let result = run_with_path("/tmp/pecrab_nonexistent_file.csv");
+        let result = File::open("/tmp/pecrab_nonexistent_file.csv")
+            .map_err(|err| EngineError::FileError { source: err });
         assert!(matches!(result, Err(EngineError::FileError { .. })));
     }
 }
