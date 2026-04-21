@@ -64,7 +64,7 @@ pub fn run() -> Result<(), EngineError> {
 }
 
 #[cfg(test)]
-mod tests {
+mod lib_tests {
     use super::*;
 
     #[test]
