@@ -19,7 +19,7 @@ pub fn run() -> Result<(), EngineError> {
     // inside an input file, transactions followed by other transations are assumed to be
     // chronologically ordered, so we can process them in a single pass.
     let buff = BufReader::new(
-        File::open(file_path).map_err(|err| EngineError::FileError(err.to_string()))?,
+        File::open(file_path).map_err(|err| EngineError::FileError { source: err })?,
     );
 
     println!("File opened successfully, starting to process transactions...");
