@@ -4,6 +4,8 @@
 use std::{fs::File, io::BufReader};
 pub mod models;
 
+pub use engine::Payments;
+mod engine;
 mod errors;
 
 use crate::{errors::EngineError, models::TransactionInfo};
@@ -37,10 +39,13 @@ pub fn run_with_path(file_path: &str) -> Result<(), EngineError> {
         File::open(file_path).map_err(|err| EngineError::FileError { source: err })?,
     );
 
+    let mut engine = Payments::new();
     for result in parse_transactions(buff) {
         match result {
             Ok(tx) => {
-                println!("Processing transaction: {:#?}", tx);
+                if let Err(e) = engine.apply(tx) {
+                    eprintln!("skipping malformed tx: {e}");
+                }
             }
             Err(e) => {
                 eprintln!("skipping unparseable row: {e}");
