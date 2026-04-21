@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+echo "[pre-push] running checks..."
+
+# Ensure we run from repo root
+pushd "$(git rev-parse --show-toplevel)" >/dev/null
+
+# Fail fast if Cargo.lock is dirty
+if ! git diff --quiet -- Cargo.lock; then
+  echo "[pre-push] Cargo.lock has uncommitted changes"
+  exit 1
+fi
+
+# Format check (fast, should always pass), build, clippy, and tests.
+cargo fmt -- --check
+cargo build
+cargo clippy -- -D warnings
+cargo test
+
+popd >/dev/null
+echo "[pre-push] OK"
