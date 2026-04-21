@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Lincoln Wallace
+
+# Clippy config file doc: https://doc.rust-lang.org/clippy/configuration.html
+# Configuration for Clippy lints on tests.
+allow-dbg-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+allow-unwrap-in-tests = true
