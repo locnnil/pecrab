@@ -52,6 +52,8 @@ fn serialize_decimal_4dp<S>(val: &Decimal, serializer: S) -> Result<S::Ok, S::Er
 where
     S: serde::Serializer,
 {
+    // TODO: Check the round stategy, search how ATM round to 4dp.
+
     // round_dp_with_strategy ensures trailing zeros are kept in Display
     let normalized = val.round_dp(4);
     serializer.serialize_str(&format!("{:.4}", normalized))
