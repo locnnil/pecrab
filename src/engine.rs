@@ -1,6 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Lincoln Wallace
 
+//! Payment engine core.
+//!
+//! # Architecture
+//!
+//! ## Event sourcing
+//! Every [`TransactionInfo`] that arrives is an immutable event. The engine never
+//! mutates past events; it only appends to two ledgers:
+//!
+//! * `tx_ledger` — canonical record of every **deposit** (the only disputable
+//!   transaction type). Keyed by the global tx ID.
+//! * `accounts` — derived state rebuilt by replaying events in order.
+//!
+//! Because transactions arrive chronologically (per spec), a single forward pass
+//! is sufficient; no replay from scratch is needed after each event.
+//!
+//! ## Per-account state machine
+//! Each account is modelled as [`AccountFsm`], which wraps an [`AccountState`]
+//! enum:
+//!
+//! ```text
+//!          deposit / withdrawal / dispute / resolve / chargeback
+//!                  ┌──────────────────────────────┐
+//!                  ▼                              │  (all except chargeback)
+//!               Active ──── chargeback ────► Locked
+//! ```
+//!
+//! Any mutating operation on a `Locked` account is silently ignored, because once
+//! a chargeback happens the account should be immediately frozen.
+
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, bail};
