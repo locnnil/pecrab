@@ -3,6 +3,10 @@ name: tests
 on:
   push:
     branches: [ "main" ]
+    path:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.*"
   pull_request:
     branches: [ "main" ]
 
