@@ -40,7 +40,7 @@ echo "1,$(sum=0; for i in {1..100001}; do ((sum += i)); done; echo "$sum").0000,
 
 To test the maximum amount of transactions that the application can handle, we can generate a large file with 4.294.967.295 transactions doing this:
 ```bash
-{ echo "type,client,tx,amount"; seq 1 4294967294 | awk '{print "deposit,1,"$0",1.0000"}'; } > sample_99_max_amount_of_transactions.csv
+{ echo "type,client,tx,amount"; seq 1 4294967294 | awk '{print "deposit,1,"$0",1.0000"}'; } > sample_00_max_amount_of_transactions.csv
 ```
 
 > [!NOTE]
@@ -49,8 +49,8 @@ To test the maximum amount of transactions that the application can handle, we c
 
 To generate the expected output file:
 ```bash
-echo 'client,available,held,total,locked' > sample_99_out.csv;
-echo "1,4294967294.0000,0.0000,4294967294.0000,false" >> sample_99_out.csv
+echo 'client,available,held,total,locked' > sample_00_out.csv;
+echo "1,4294967294.0000,0.0000,4294967294.0000,false" >> sample_00_out.csv
 ```
 
 This will create a file with 4.294.967.295 transactions, which is the maximum value for a u32, and will test the application's ability to handle such a large number of transactions.
@@ -75,6 +75,28 @@ sudo systemd-run --scope \
 ```
 
 So far, without running on a systemd scope, the application get's killed by the OOM killer.
+
+#### Introducing samples with large amount of transactions
+
+To test the application ability of handling a large amount of transactions, was generated samples with
+1k, 100k, 1M, 10M, 100M, 500M and 1B transactions.
+
+By executing:
+```bash
+# Generate 1k transactions
+{ echo "type,client,tx,amount"; seq 1 1000 | awk '{print "deposit,1,"$0",1.0"}'; } > sample_99_1k_transactions.csv
+echo 'client,available,held,total,locked' > sample_99_out.csv
+echo "1,1000.0, 0.0000, 1000.0, false" >> sample_99_out.csv
+
+# Generate 100k transactions
+{ echo "type,client,tx,amount"; seq 1 100000 | awk '{print "deposit,1,"$0",1.0"}'; } > sample_98_100k_transactions.csv
+echo 'client,available,held,total,locked' > sample_98_out.csv
+echo "1,100000.0, 0.0000, 100000.0, false" >> sample_98_out.csv
+
+# ...
+```
+
+The samples up to 1M were added to the repository (with file size of 20MB), but the samples with more than 1M transactions weren't added to avoid the need of using git LFS.
 
 #### Possible solutions to handle a large amount of transactions
 
