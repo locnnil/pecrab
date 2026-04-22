@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Lincoln Wallace
 
+// Integration test helpers are not annotated with #[test], so the
+// allow-*-in-tests .clippy.toml options don't apply to them.
+#![allow(clippy::panic, clippy::unwrap_used)]
+
 use std::{
     collections::HashMap,
     fs::File,
