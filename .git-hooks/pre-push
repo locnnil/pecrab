@@ -15,7 +15,7 @@ fi
 # Format check (fast, should always pass), build, clippy, and tests.
 cargo fmt -- --check
 cargo build
-cargo clippy -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 
 popd >/dev/null
