@@ -53,10 +53,16 @@ where
     S: serde::Serializer,
 {
     // TODO: Check the round stategy, search how ATM round to 4dp.
-
-    // round_dp_with_strategy ensures trailing zeros are kept in Display
     let normalized = val.round_dp(4);
-    serializer.serialize_str(&format!("{:.4}", normalized))
+    let s = format!("{:.4}", normalized);
+    // Trim trailing zeros after the decimal, but always keep at least one digit
+    let trimmed = s.trim_end_matches('0');
+    let result = if trimmed.ends_with('.') {
+        format!("{}0", trimmed)
+    } else {
+        trimmed.to_string()
+    };
+    serializer.serialize_str(&result)
 }
 
 #[derive(Debug, Serialize)]
