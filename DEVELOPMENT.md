@@ -113,3 +113,13 @@ But if instead switching the mental model to a multi-pass approach, we can first
 This would break the buffering model
 
 - **Using an Rust native embedded key-value store like ReDB**: Similar to the SQLite3 approach, but using a Rust native embeded key-value store. With a tempfile backend, we can store the transactions on disk without worrying about the unsafe C code FFI.
+
+The last approach is the one implemented in the current version of the application, and it works well for the test cases (1k, 100k, 1M, 100M and 500M transactions).
+The amount of memory used is kept constant around 2GB, due to the constraint in code of keeping up to 50M in memory, and flushing to disk after this number.
+
+#### Parallelization
+
+Since the application is currently single-threaded, it can be parallelized by using multiple threads to process the transactions in parallel.
+One of the assumptions is that transactions are isolated by client, so we can process transactions of different clients in parallel without worrying about race conditions.
+One possible approach is to use a dispatcher thread that reads the transactions from the file and dispatches them to worker threads based on the client id.
+Each worker thread would then process the transactions for its assigned clients and update the accounts accordingly.
