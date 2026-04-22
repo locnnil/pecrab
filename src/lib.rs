@@ -33,7 +33,8 @@ fn parse_file_path(arg: Option<String>) -> Result<String, EngineError> {
 
 /// Processes transactions from the CSV file at `file_path`.
 pub fn run_with_writer<R: Read, W: Write>(reader: R, writer: W) -> Result<(), EngineError> {
-    let mut engine = Payments::new();
+    let mut engine = Payments::new().map_err(|e| EngineError::LedgerInitError(e.to_string()))?;
+
     for result in parse_transactions(reader) {
         match result {
             Ok(tx) => {

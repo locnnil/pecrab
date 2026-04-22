@@ -23,4 +23,8 @@ pub enum EngineError {
         #[from]
         source: std::io::Error,
     },
+
+    /// Indicates an error initialising the on-disk transaction ledger.
+    #[error("ledger init error: {0}")]
+    LedgerInitError(String),
 }

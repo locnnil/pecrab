@@ -5,12 +5,22 @@
 //!
 //! # Architecture
 //!
+//! ## Storage
+//! The deposit ledger is backed by [`redb`], an embedded key-value store that
+//! spills to a temporary file on disk. This keeps heap usage O(clients +
+//! open-disputes) regardless of total deposit count, allowing the engine to
+//! process the full u32 transaction-ID space (~4 billion deposits) without
+//! exhausting RAM. Each event opens a fresh transaction (read or write); commits
+//! use [`Durability::None`] so no fsync is performed — safe because the backing
+//! file is temporary and the engine does not need crash recovery.
+//!
 //! ## Event sourcing
 //! Every [`TransactionInfo`] that arrives is an immutable event. The engine never
-//! mutates past events; it only appends to two ledgers:
+//! mutates past events; it only appends to the deposit ledger and applies derived
+//! changes to `accounts`.
 //!
 //! * `tx_ledger` — canonical record of every **deposit** (the only disputable
-//!   transaction type). Keyed by the global tx ID.
+//!   transaction type). Backed by redb; keyed by the global tx ID.
 //! * `accounts` — derived state rebuilt by replaying events in order.
 //!
 //! Because transactions arrive chronologically (per spec), a single forward pass
@@ -30,12 +40,62 @@
 //! Any mutating operation on a `Locked` account is silently ignored, because once
 //! a chargeback happens the account should be immediately frozen.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use redb::{Database, Durability, ReadableDatabase, TableDefinition};
 use rust_decimal::Decimal;
+use tempfile::{Builder, NamedTempFile};
 
 use crate::models::{Account, TransactionInfo, TransactionType};
+
+// ---------------------------------------------------------------------------
+// On-disk table
+// ---------------------------------------------------------------------------
+
+/// The deposit ledger table stored in redb.
+///
+/// * Key   — `u32` global transaction ID
+/// * Value — 18-byte [`DepositRecord`] encoding:
+///   `[0..2]` = client (u16, little-endian) | `[2..18]` = amount (Decimal
+///   16-byte serialisation via [`rust_decimal::Decimal::serialize`])
+const DEPOSITS: TableDefinition<u32, [u8; 18]> = TableDefinition::new("deposits");
+
+/// Number of deposits to buffer in memory before flushing to redb.
+///
+/// redb is a copy-on-write B-tree: every commit allocates fresh pages along
+/// the modified path (~4–5 × 4KB ≈ 16KB of write amplification), independent
+/// of payload size. Per-event commits therefore inflate both runtime and disk
+/// usage by orders of magnitude (observed: 10M deposits → 150GB on-disk,
+/// >40min). Batching amortises that cost across many inserts.
+///
+/// Tuning: larger values reduce per-commit overhead but increase peak memory
+/// (each pending entry is ~50 bytes including HashMap overhead) and lengthen
+/// the window during which a referenced deposit is invisible to read
+/// transactions; though that is masked by the in-memory pending lookup, so
+/// only the memory cost is a real ceiling.
+const COMMIT_BATCH_SIZE: usize = 50_000_000;
+
+/// Encode a [`DepositRecord`] into 18 bytes for redb storage.
+fn encode_record(r: &DepositRecord) -> [u8; 18] {
+    let mut buf = [0u8; 18];
+    buf[..2].copy_from_slice(&r.client.to_le_bytes());
+    buf[2..].copy_from_slice(&r.amount.serialize());
+    buf
+}
+
+/// Decode a 18-byte redb value back into a [`DepositRecord`].
+fn decode_record(buf: [u8; 18]) -> DepositRecord {
+    let client = u16::from_le_bytes([buf[0], buf[1]]);
+    let amount = Decimal::deserialize([
+        buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12],
+        buf[13], buf[14], buf[15], buf[16], buf[17],
+    ]);
+    DepositRecord { client, amount }
+}
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -49,12 +109,13 @@ pub enum AccountState {
 }
 
 /// All the data needed to later process a dispute against a deposit.
+///
+/// Whether a deposit is currently under dispute is tracked exclusively by
+/// [`Payments::disputed`] to avoid a disk write on every state transition.
 #[derive(Debug, Clone)]
 struct DepositRecord {
     client: u16,
     amount: Decimal,
-    /// Whether this deposit is currently under an open dispute.
-    disputed: bool,
 }
 
 /// Per-account state machine.
@@ -185,27 +246,67 @@ pub struct Payments {
     /// Derived account state, keyed by client ID.
     accounts: HashMap<u16, AccountFsm>,
 
-    /// Immutable deposit ledger. Only deposits are stored because they are
-    /// the only transaction type that can be disputed per the spec.
-    ///
-    /// Key: global tx ID.
-    tx_ledger: HashMap<u32, DepositRecord>,
-
     /// Set of tx IDs that are currently under an open dispute.
     ///
-    /// Kept separately from `DepositRecord::disputed` for O(1) membership
-    /// tests without a ledger lookup.
+    /// Kept in memory for O(1) membership tests without a disk lookup.
     disputed: HashSet<u32>,
+
+    /// Deposits observed but not yet flushed to redb.
+    ///
+    /// Capped at [`COMMIT_BATCH_SIZE`]; flushed in a single redb write
+    /// transaction once full. Read paths (dispute / resolve / chargeback)
+    /// consult this map first, so an unflushed deposit is still visible to
+    /// the referencing event.
+    pending: HashMap<u32, DepositRecord>,
+
+    // Field declaration order matters: Rust drops struct fields in declaration
+    // order. `db` must be dropped before `_tmp` so the database is closed
+    // before its backing file is deleted.
+    /// The redb database handle.
+    db: Database,
+
+    /// Temporary file that backs the redb database.
+    _tmp: NamedTempFile,
 }
 
 impl Payments {
-    /// Create a new, empty engine.
-    pub fn new() -> Self {
-        Self {
+    /// Create a new, empty engine backed by a temporary redb database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the temporary file or the redb database cannot be
+    /// created, or if the deposits table cannot be initialised.
+    pub fn new() -> Result<Self> {
+        let dir = resolve_ledger_dir();
+        let tmp = Builder::new()
+            .prefix("pecrab-ledger-")
+            .tempfile_in(&dir)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary ledger file in {}",
+                    dir.display()
+                )
+            })?;
+        let db = Database::create(tmp.path()).context("failed to open redb database")?;
+
+        // Eagerly initialise the table so subsequent read transactions can find
+        // it even before the first deposit has been written.
+        let mut txn = db
+            .begin_write()
+            .context("failed to begin initial write transaction")?;
+        txn.set_durability(Durability::None)?;
+        txn.open_table(DEPOSITS)
+            .context("failed to initialise deposits table")?;
+        txn.commit()
+            .context("failed to commit table initialisation")?;
+
+        Ok(Self {
             accounts: HashMap::new(),
-            tx_ledger: HashMap::new(),
             disputed: HashSet::new(),
-        }
+            pending: HashMap::with_capacity(COMMIT_BATCH_SIZE),
+            db,
+            _tmp: tmp,
+        })
     }
 
     /// Apply a single event to the engine state.
@@ -213,14 +314,14 @@ impl Payments {
     /// Business-rule violations (unknown tx, locked account, insufficient
     /// funds, etc.) are silently skipped — they are not errors in the
     /// engine's operation. Only structural problems (e.g. a deposit missing
-    /// its `amount` field) return `Err`.
+    /// its `amount` field) or I/O failures against the ledger return `Err`.
     pub fn apply(&mut self, event: TransactionInfo) -> Result<()> {
         match event.type_tx {
             TransactionType::Deposit => self.handle_deposit(event)?,
             TransactionType::Withdrawal => self.handle_withdrawal(event)?,
-            TransactionType::Dispute => self.handle_dispute(event),
-            TransactionType::Resolve => self.handle_resolve(event),
-            TransactionType::Chargeback => self.handle_chargeback(event),
+            TransactionType::Dispute => self.handle_dispute(event)?,
+            TransactionType::Resolve => self.handle_resolve(event)?,
+            TransactionType::Chargeback => self.handle_chargeback(event)?,
         }
         Ok(())
     }
@@ -238,23 +339,25 @@ impl Payments {
     fn handle_deposit(&mut self, event: TransactionInfo) -> Result<()> {
         let amount = require_amount(&event)?;
 
-        // Record the deposit in the immutable ledger before mutating account
-        // state. If the tx ID already exists we treat it as a duplicate and
-        // skip — tx IDs are globally unique per spec.
-        if self.tx_ledger.contains_key(&event.tx) {
+        // Duplicate check: pending buffer first (cheap), then the on-disk
+        // ledger. Tx IDs are globally unique per spec, so a hit here means
+        // the partner re-sent the same event and we silently skip it.
+        if self.pending.contains_key(&event.tx) || self.db_contains(event.tx)? {
             return Ok(());
         }
 
-        self.tx_ledger.insert(
+        self.pending.insert(
             event.tx,
             DepositRecord {
                 client: event.client,
                 amount,
-                disputed: false,
             },
         );
-
         self.account_mut(event.client).apply_deposit(amount);
+
+        if self.pending.len() >= COMMIT_BATCH_SIZE {
+            self.flush()?;
+        }
         Ok(())
     }
 
@@ -264,82 +367,80 @@ impl Payments {
         Ok(())
     }
 
-    fn handle_dispute(&mut self, event: TransactionInfo) {
+    fn handle_dispute(&mut self, event: TransactionInfo) -> Result<()> {
         // Lookup the referenced deposit; ignore if not found (partner error).
-        let record = match self.tx_ledger.get_mut(&event.tx) {
+        let record = match self.lookup_deposit(event.tx)? {
             Some(r) => r,
-            None => return,
+            None => return Ok(()),
         };
 
         // Cross-client dispute guard: only the owning client may dispute.
         if record.client != event.client {
-            return;
+            return Ok(());
         }
 
         // Ignore if already disputed (idempotency guard).
-        if record.disputed {
-            return;
+        if self.disputed.contains(&event.tx) {
+            return Ok(());
         }
 
         let amount = record.amount;
-        record.disputed = true;
         self.disputed.insert(event.tx);
 
         if !self.account_mut(event.client).apply_dispute(amount) {
             // Undo the disputed flag — the dispute was not applied.
-            let record = self.tx_ledger.get_mut(&event.tx).expect("just looked up");
-            record.disputed = false;
             self.disputed.remove(&event.tx);
             eprintln!(
                 "dispute for tx {} (client {}) ignored: insufficient available funds",
                 event.tx, event.client
             );
         }
+
+        Ok(())
     }
 
-    fn handle_resolve(&mut self, event: TransactionInfo) {
+    fn handle_resolve(&mut self, event: TransactionInfo) -> Result<()> {
         // The tx must exist, belong to this client, and currently be disputed.
-        let record = match self.tx_ledger.get_mut(&event.tx) {
+        let record = match self.lookup_deposit(event.tx)? {
             Some(r) => r,
-            None => return,
+            None => return Ok(()),
         };
 
         if record.client != event.client {
-            return;
+            return Ok(());
         }
 
-        if !record.disputed {
-            return;
+        if !self.disputed.contains(&event.tx) {
+            return Ok(());
         }
 
-        let amount = record.amount;
-        record.disputed = false;
         self.disputed.remove(&event.tx);
+        self.account_mut(event.client).apply_resolve(record.amount);
 
-        self.account_mut(event.client).apply_resolve(amount);
+        Ok(())
     }
 
-    fn handle_chargeback(&mut self, event: TransactionInfo) {
+    fn handle_chargeback(&mut self, event: TransactionInfo) -> Result<()> {
         // The tx must exist, belong to this client, and currently be disputed.
-        let record = match self.tx_ledger.get_mut(&event.tx) {
+        let record = match self.lookup_deposit(event.tx)? {
             Some(r) => r,
-            None => return,
+            None => return Ok(()),
         };
 
         if record.client != event.client {
-            return;
+            return Ok(());
         }
 
-        if !record.disputed {
-            return;
+        if !self.disputed.contains(&event.tx) {
+            return Ok(());
         }
 
-        let amount = record.amount;
         // Mark as no longer disputed (it's now finalised / charged back).
-        record.disputed = false;
         self.disputed.remove(&event.tx);
+        self.account_mut(event.client)
+            .apply_chargeback(record.amount);
 
-        self.account_mut(event.client).apply_chargeback(amount);
+        Ok(())
     }
 
     // -- Helpers -------------------------------------------------------------
@@ -351,17 +452,119 @@ impl Payments {
             .entry(client)
             .or_insert_with(|| AccountFsm::new(client))
     }
-}
 
-impl Default for Payments {
-    fn default() -> Self {
-        Self::new()
+    // -- redb helpers --------------------------------------------------------
+
+    /// Look up a deposit by tx ID — pending buffer first, then on-disk ledger.
+    ///
+    /// Used by dispute / resolve / chargeback handlers, which never mutate
+    /// the ledger.
+    fn lookup_deposit(&self, tx_id: u32) -> Result<Option<DepositRecord>> {
+        if let Some(record) = self.pending.get(&tx_id) {
+            return Ok(Some(record.clone()));
+        }
+        let txn = self
+            .db
+            .begin_read()
+            .context("failed to begin read transaction")?;
+        let table = txn
+            .open_table(DEPOSITS)
+            .context("failed to open deposits table")?;
+        Ok(table
+            .get(tx_id)
+            .context("failed to look up deposit record")?
+            .map(|guard| decode_record(guard.value())))
+    }
+
+    /// Return `true` if `tx_id` is already present in the on-disk ledger.
+    ///
+    /// Pending buffer membership is checked separately by the caller — keeping
+    /// this method scoped to disk lookup makes the cost obvious at the call
+    /// site.
+    fn db_contains(&self, tx_id: u32) -> Result<bool> {
+        let txn = self
+            .db
+            .begin_read()
+            .context("failed to begin read transaction")?;
+        let table = txn
+            .open_table(DEPOSITS)
+            .context("failed to open deposits table")?;
+        Ok(table
+            .get(tx_id)
+            .context("failed to look up deposit record")?
+            .is_some())
+    }
+
+    /// Drain the pending buffer into redb in a single write transaction.
+    ///
+    /// Opens the deposits table once, inserts every buffered record, then
+    /// commits. With [`Durability::None`] the commit is memory-only (no
+    /// fsync). Called automatically when the buffer reaches
+    /// [`COMMIT_BATCH_SIZE`].
+    fn flush(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        let mut txn = self
+            .db
+            .begin_write()
+            .context("failed to begin write transaction")?;
+        txn.set_durability(Durability::None)?;
+        {
+            let mut table = txn
+                .open_table(DEPOSITS)
+                .context("failed to open deposits table")?;
+            for (tx_id, record) in self.pending.drain() {
+                table
+                    .insert(tx_id, encode_record(&record))
+                    .context("failed to insert deposit record")?;
+            }
+        }
+        txn.commit().context("failed to commit deposit batch")?;
+        Ok(())
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Environment variable that overrides the directory used to host the redb
+/// ledger file. Useful for steering the ledger onto a specific scratch volume
+/// (e.g. an NVMe disk) in production.
+const LEDGER_DIR_ENV: &str = "PECRAB_LEDGER_DIR";
+
+/// Resolve the directory in which to place the ephemeral ledger file.
+///
+/// Resolution order:
+/// 1. `PECRAB_LEDGER_DIR` environment variable — explicit operator override.
+/// 2. `/var/tmp` — per the FHS, must be preserved across reboots, so distros
+///    conventionally back it with disk (unlike `/tmp`, which is `tmpfs` on
+///    most modern systemd-default installations).
+/// 3. [`std::env::temp_dir`] — last resort. Logs a warning to stderr because
+///    this is typically `/tmp`, which on many distributions is RAM-backed —
+///    defeating the point of spilling the ledger to disk.
+fn resolve_ledger_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(LEDGER_DIR_ENV) {
+        return PathBuf::from(dir);
+    }
+
+    let var_tmp = PathBuf::from("/var/tmp");
+    if var_tmp.is_dir() {
+        return var_tmp;
+    }
+
+    let fallback = std::env::temp_dir();
+    eprintln!(
+        "warning: /var/tmp is not available; falling back to {} for the ledger file. \
+         This directory may be tmpfs (RAM-backed), which would defeat the purpose of \
+         spilling the ledger to disk. Set {} to a disk-backed directory to silence this warning.",
+        fallback.display(),
+        LEDGER_DIR_ENV,
+    );
+    fallback
+}
 
 /// Extract the `amount` field from an event that requires one (deposit,
 /// withdrawal). Returns `Err` if the field is absent — that signals a
@@ -439,7 +642,7 @@ mod tests {
 
     #[test]
     fn deposit_creates_account_and_credits_available() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
 
         let accounts = accounts_map(e);
@@ -452,7 +655,7 @@ mod tests {
 
     #[test]
     fn duplicate_tx_id_is_ignored() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(deposit(1, 1, dec!(50.0000))).unwrap(); // same tx ID
 
@@ -464,7 +667,7 @@ mod tests {
 
     #[test]
     fn withdrawal_debits_available() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(withdrawal(1, 2, dec!(40.0000))).unwrap();
 
@@ -475,7 +678,7 @@ mod tests {
 
     #[test]
     fn withdrawal_fails_silently_on_insufficient_funds() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         e.apply(deposit(1, 1, dec!(10.0000))).unwrap();
         e.apply(withdrawal(1, 2, dec!(20.0000))).unwrap(); // exceeds available
 
@@ -487,7 +690,7 @@ mod tests {
 
     #[test]
     fn dispute_moves_funds_to_held() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(dispute(1, 1)).unwrap();
 
@@ -500,7 +703,7 @@ mod tests {
 
     #[test]
     fn dispute_with_insufficient_available_is_ignored() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         e.apply(deposit(1, 1, dec!(100.0))).unwrap();
         e.apply(withdrawal(1, 2, dec!(100.0))).unwrap(); // drain available
         e.apply(dispute(1, 1)).unwrap(); // available < deposit amount → ignored
@@ -514,7 +717,7 @@ mod tests {
 
     #[test]
     fn dispute_unknown_tx_is_ignored() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(dispute(1, 99)).unwrap(); // tx 99 does not exist
 
@@ -525,7 +728,7 @@ mod tests {
 
     #[test]
     fn dispute_cross_client_is_ignored() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(dispute(2, 1)).unwrap(); // client 2 tries to dispute client 1's tx
 
@@ -534,11 +737,24 @@ mod tests {
         assert_eq!(accounts[&1].held, dec!(0.0000));
     }
 
+    #[test]
+    fn dispute_idempotency() {
+        let mut e = Payments::new().unwrap();
+        e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
+        e.apply(dispute(1, 1)).unwrap();
+        e.apply(dispute(1, 1)).unwrap(); // duplicate dispute
+
+        let accounts = accounts_map(e);
+        let acc = &accounts[&1];
+        assert_eq!(acc.available, dec!(0.0000));
+        assert_eq!(acc.held, dec!(100.0000));
+    }
+
     // -- Resolve -------------------------------------------------------------
 
     #[test]
     fn resolve_moves_held_back_to_available() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(dispute(1, 1)).unwrap();
         e.apply(resolve(1, 1)).unwrap();
@@ -552,7 +768,7 @@ mod tests {
 
     #[test]
     fn resolve_on_undisputed_tx_is_ignored() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(resolve(1, 1)).unwrap(); // not disputed
 
@@ -565,7 +781,7 @@ mod tests {
 
     #[test]
     fn chargeback_deducts_held_and_locks_account() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(dispute(1, 1)).unwrap();
         e.apply(chargeback(1, 1)).unwrap();
@@ -580,7 +796,7 @@ mod tests {
 
     #[test]
     fn chargeback_on_undisputed_tx_is_ignored() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(chargeback(1, 1)).unwrap(); // no prior dispute
 
@@ -591,7 +807,7 @@ mod tests {
 
     #[test]
     fn locked_account_ignores_all_mutations() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(dispute(1, 1)).unwrap();
         e.apply(chargeback(1, 1)).unwrap(); // locks the account
@@ -609,7 +825,7 @@ mod tests {
 
     #[test]
     fn multiple_clients_are_independent() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(deposit(2, 2, dec!(200.0000))).unwrap();
         e.apply(withdrawal(1, 3, dec!(50.0000))).unwrap();
@@ -623,7 +839,7 @@ mod tests {
 
     #[test]
     fn deposit_without_amount_returns_err() {
-        let mut e = Payments::new();
+        let mut e = Payments::new().unwrap();
         let result = e.apply(TransactionInfo {
             type_tx: TransactionType::Deposit,
             client: 1,
