@@ -36,5 +36,42 @@ echo "1,$(sum=0; for i in {1..100001}; do ((sum += i)); done; echo "$sum").0000,
 > For example, `{1..100000000}` expands to a massive argument list,
 > which may degrade performance or fail entirely.
 
+### Pushing to the limits
 
+To test the maximum amount of transactions that the application can handle, we can generate a large file with 4.294.967.295 transactions doing this:
+```bash
+{ echo "type,client,tx,amount"; seq 1 4294967294 | awk '{print "deposit,1,"$0",1.0000"}'; } > sample_99_max_amount_of_transactions.csv
+```
 
+> [!NOTE]
+> The above command is safe to run as it streams the output directly to the file without loading it all into memory at once.
+> However, be aware that generating such a large file will take a significant amount of time and disk space.
+
+To generate the expected output file:
+```bash
+echo 'client,available,held,total,locked' > sample_99_out.csv;
+echo "1,4294967294.0000,0.0000,4294967294.0000,false" >> sample_99_out.csv
+```
+
+This will create a file with 4.294.967.295 transactions, which is the maximum value for a u32, and will test the application's ability to handle such a large number of transactions.
+The generated file has **111GB** of size, and wasn't included in the repository, but it can be generated using the above command.
+
+```console
+ du -sh sample_15_max_amount_of_transactions.csv
+111G    sample_15_max_amount_of_transactions.csv
+```
+
+The command below executes the application inside a transient systemd scope with a 4 GiB memory cap and an 80% CPU quota.
+This isolates resource usage from the rest of the system and allows the run to be monitored via `systemd-cgtop` or `systemctl status`.
+
+```bash
+cargo build --release
+sudo systemd-run --scope \
+    -p MemoryMax=4G \
+    -p CPUQuota=80% \
+    /usr/bin/time -v \
+    ./target/release/pe_crab tests/sample_99_max_amount_of_transactions.csv \
+    > sample_99_out.csv
+```
+
+So far, without running on a systemd scope, the application get's killed by the OOM killer.
