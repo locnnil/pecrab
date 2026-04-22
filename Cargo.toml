@@ -3,6 +3,18 @@ name = "pecrab"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+panic = "warn"
+todo = "warn"
+unnecessary_self_imports = "warn"
+unreachable = "warn"
+unwrap_in_result = "warn"
+unwrap_used = "warn"
+use_self = "warn"
+
 [dependencies]
 anyhow = "1.0.102"
 csv = "1.4.0"
