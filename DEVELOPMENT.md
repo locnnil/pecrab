@@ -75,3 +75,19 @@ sudo systemd-run --scope \
 ```
 
 So far, without running on a systemd scope, the application get's killed by the OOM killer.
+
+#### Possible solutions to handle a large amount of transactions
+
+Some of the solutions considered to handle such a large amount of transactions include:
+
+- **Using a light database like SQLite3**: At first, I thought about using SQLite3 to store the transactions, the raw idea was: Keep in memeory up to a number of transactions, then after this number, flush the transactions to the disk, and when we need to access a transaction, we can read it from the disk. This way we can handle a large number of transactions without consuming too much memory.
+  - The problem with this approach is that it would add a lot of complexity to the application, and it would also add a lot of overhead to the performance, since we would need to read and write to the disk for every transaction.
+  - Considering also write amplification, since we would need to write the transactions to the disk multiple times, this approach would not be efficient and could cause a 100-1000x performance degradation. Mostly due to the nature of how most dbms handles writes using B-trees.
+  - Also we would have to deal with the unsafe C code FFI to use SQLite3, which is not ideal for this project.
+  - So, it works, but it's not a good solution for this problem.
+
+- **Parsing the transactions file in multiple passes**: We just need to hold transactions in memory for the case that a dispute is made then it references that transaction.
+But if instead switching the mental model to a multi-pass approach, we can first pass the entire file and collect every tx id that is referenced by a dispute.
+This would break the buffering model
+
+- **Using an Rust native embedded key-value store like ReDB**: Similar to the SQLite3 approach, but using a Rust native embeded key-value store. With a tempfile backend, we can store the transactions on disk without worrying about the unsafe C code FFI.
