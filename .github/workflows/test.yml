@@ -98,10 +98,3 @@ jobs:
             echo ""
             echo "> Full HTML report (with graphs) is available in the **criterion-report** artifact below."
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload Criterion report
-        uses: actions/upload-artifact@v4
-        with:
-          name: criterion-report
-          path: target/criterion/
-          retention-days: 30
