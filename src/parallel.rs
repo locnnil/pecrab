@@ -110,6 +110,7 @@ async fn dispatch<R: Read + Send + 'static, W: Write>(
                 let client = tx.client;
                 let sender = actor_senders.entry(client).or_insert_with(|| {
                     let (s, r) = unbounded_channel();
+                    // Spawn a new actor task for this client.
                     handles.push(tokio::spawn(run_actor(r)));
                     s
                 });

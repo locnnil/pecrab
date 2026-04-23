@@ -15,7 +15,7 @@ mod parallel;
 use crate::models::TransactionInfo;
 
 use csv::{ReaderBuilder, Trim};
-use std::io::{Read, Write};
+use std::io::Read;
 
 pub fn parse_transactions<R: Read>(
     reader: R,
@@ -33,34 +33,6 @@ fn parse_file_path(arg: Option<String>) -> Result<String, EngineError> {
     arg.ok_or_else(|| {
         EngineError::InvalidCliArgument("CSV filename missing in cli argument".to_owned())
     })
-}
-
-/// Processes transactions from the CSV file at `file_path`.
-pub fn run_with_writer<R: Read, W: Write>(reader: R, writer: W) -> Result<(), EngineError> {
-    let mut engine = Payments::new().map_err(|e| EngineError::LedgerInitError(e.to_string()))?;
-
-    for result in parse_transactions(reader) {
-        match result {
-            Ok(tx) => {
-                if let Err(e) = engine.apply(tx) {
-                    eprintln!("skipping malformed tx: {e}");
-                }
-            }
-            Err(e) => {
-                eprintln!("skipping unparseable row: {e}");
-            }
-        }
-    }
-
-    let mut csv_writer = csv::Writer::from_writer(writer);
-    for account in engine.accounts() {
-        csv_writer
-            .serialize(account)
-            .map_err(|e| EngineError::CsvParseError { source: e })?;
-    }
-    csv_writer.flush()?;
-
-    Ok(())
 }
 
 /// Runs the payment engine using CLI arguments.
@@ -97,7 +69,7 @@ mod lib_tests {
         let path = "/tmp/pecrab_test_existing.csv";
         std::fs::write(path, "type,client,tx,amount\n").unwrap();
         let file = File::open(path).unwrap();
-        let result = run_with_writer(BufReader::new(file), std::io::sink());
+        let result = run_with_writer_parallel(BufReader::new(file), std::io::sink());
         std::fs::remove_file(path).unwrap();
         assert!(result.is_ok());
     }

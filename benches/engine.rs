@@ -19,7 +19,7 @@ fn bench_engine(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(csv.len() as u64));
         group.bench_function(name, |b| {
             b.iter(|| {
-                pecrab::run_with_writer(csv, sink()).expect("engine failed");
+                pecrab::run_with_writer_parallel(csv, sink()).expect("engine failed");
             });
         });
     }

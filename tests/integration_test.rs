@@ -119,12 +119,6 @@ fn discover_samples() -> Vec<(PathBuf, PathBuf)> {
     pairs
 }
 
-fn run_sample(input: &Path, expected_path: &Path) {
-    run_sample_with(input, expected_path, |r, buf| {
-        pecrab::run_with_writer(r, buf)
-    });
-}
-
 fn run_sample_parallel(input: &Path, expected_path: &Path) {
     run_sample_with(input, expected_path, |r, buf| {
         pecrab::run_with_writer_parallel(r, buf)
@@ -178,40 +172,6 @@ where
             errors.join("\n")
         );
     }
-}
-
-#[test]
-fn all_samples() {
-    let pairs = discover_samples();
-
-    let mut failures: Vec<String> = Vec::new();
-
-    for (input, expected) in &pairs {
-        let result = std::panic::catch_unwind(|| run_sample(input, expected));
-        if let Err(e) = result {
-            let msg = e
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_else(|| "unknown panic".to_string());
-            failures.push(format!(
-                "{}: {}",
-                input.file_name().unwrap().to_str().unwrap(),
-                msg
-            ));
-        }
-    }
-
-    if !failures.is_empty() {
-        panic!(
-            "{}/{} sample(s) failed:\n\n{}",
-            failures.len(),
-            pairs.len(),
-            failures.join("\n\n")
-        );
-    }
-
-    println!("{} sample(s) passed", pairs.len());
 }
 
 #[test]
