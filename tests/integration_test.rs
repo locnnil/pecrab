@@ -120,13 +120,27 @@ fn discover_samples() -> Vec<(PathBuf, PathBuf)> {
 }
 
 fn run_sample(input: &Path, expected_path: &Path) {
+    run_sample_with(input, expected_path, |r, buf| {
+        pecrab::run_with_writer(r, buf)
+    });
+}
+
+fn run_sample_parallel(input: &Path, expected_path: &Path) {
+    run_sample_with(input, expected_path, |r, buf| {
+        pecrab::run_with_writer_parallel(r, buf)
+    });
+}
+
+fn run_sample_with<F>(input: &Path, expected_path: &Path, engine: F)
+where
+    F: FnOnce(BufReader<File>, &mut Vec<u8>) -> Result<(), pecrab::EngineError>,
+{
     let reader = BufReader::new(
         File::open(input).unwrap_or_else(|e| panic!("cannot open {:?}: {e}", input)),
     );
 
     let mut output_buf: Vec<u8> = Vec::new();
-    pecrab::run_with_writer(reader, &mut output_buf)
-        .unwrap_or_else(|e| panic!("engine error on {:?}: {e}", input));
+    engine(reader, &mut output_buf).unwrap_or_else(|e| panic!("engine error on {:?}: {e}", input));
 
     let actual_csv = String::from_utf8(output_buf).expect("engine output is not valid UTF-8");
     let expected_csv = std::fs::read_to_string(expected_path)
@@ -198,4 +212,38 @@ fn all_samples() {
     }
 
     println!("{} sample(s) passed", pairs.len());
+}
+
+#[test]
+fn all_samples_parallel() {
+    let pairs = discover_samples();
+
+    let mut failures: Vec<String> = Vec::new();
+
+    for (input, expected) in &pairs {
+        let result = std::panic::catch_unwind(|| run_sample_parallel(input, expected));
+        if let Err(e) = result {
+            let msg = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown panic".to_string());
+            failures.push(format!(
+                "{}: {}",
+                input.file_name().unwrap().to_str().unwrap(),
+                msg
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "{}/{} sample(s) failed:\n\n{}",
+            failures.len(),
+            pairs.len(),
+            failures.join("\n\n")
+        );
+    }
+
+    println!("{} sample(s) passed (parallel)", pairs.len());
 }

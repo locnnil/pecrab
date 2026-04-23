@@ -5,11 +5,14 @@ use std::{fs::File, io::BufReader};
 pub mod models;
 
 pub use engine::Payments;
+pub use errors::EngineError;
+pub use parallel::run_with_writer_parallel;
 mod engine;
 mod env;
 mod errors;
+mod parallel;
 
-use crate::{errors::EngineError, models::TransactionInfo};
+use crate::models::TransactionInfo;
 
 use csv::{ReaderBuilder, Trim};
 use std::io::{Read, Write};
@@ -69,7 +72,8 @@ pub fn run() -> Result<(), EngineError> {
     let buff = BufReader::new(
         File::open(file_path).map_err(|err| EngineError::FileError { source: err })?,
     );
-    run_with_writer(buff, std::io::stdout())
+
+    run_with_writer_parallel(buff, std::io::stdout())
 }
 
 #[cfg(test)]

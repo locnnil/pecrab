@@ -27,4 +27,12 @@ pub enum EngineError {
     /// Indicates an error initialising the on-disk transaction ledger.
     #[error("ledger init error: {0}")]
     LedgerInitError(String),
+
+    /// A tokio task panicked or was cancelled.
+    #[error("async task error: {0}")]
+    TaskError(String),
+
+    /// The tokio runtime could not be constructed.
+    #[error("runtime error: {0}")]
+    RuntimeError(String),
 }

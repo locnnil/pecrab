@@ -6,13 +6,14 @@
 //! # Architecture
 //!
 //! ## Storage
-//! The deposit ledger is backed by [`redb`], an embedded key-value store that
-//! spills to a temporary file on disk. This keeps heap usage O(clients +
-//! open-disputes) regardless of total deposit count, allowing the engine to
-//! process the full u32 transaction-ID space (~4 billion deposits) without
-//! exhausting RAM. Each event opens a fresh transaction (read or write); commits
-//! use [`Durability::None`] so no fsync is performed — safe because the backing
-//! file is temporary and the engine does not need crash recovery.
+//! Deposits are held in an insertion-ordered in-memory buffer ([`IndexMap`]).
+//! When the buffer first reaches `max_pending` entries a temporary [`redb`]
+//! database is created **lazily** and the oldest 10 % are evicted to it.
+//! Subsequent overflows reuse the same file. This bounds heap usage to
+//! `max_pending` entries — allowing the full u32 transaction-ID space to be
+//! processed — while paying zero disk cost for engines that stay within the
+//! memory budget. Commits use [`Durability::None`] (no fsync) because the
+//! backing file is ephemeral and crash recovery is not required.
 //!
 //! ## Event sourcing
 //! Every [`TransactionInfo`] that arrives is an immutable event. The engine never
@@ -20,7 +21,7 @@
 //! changes to `accounts`.
 //!
 //! * `tx_ledger` — canonical record of every **deposit** (the only disputable
-//!   transaction type). Backed by redb; keyed by the global tx ID.
+//!   transaction type). Backed by redb when spilled; keyed by the global tx ID.
 //! * `accounts` — derived state rebuilt by replaying events in order.
 //!
 //! Because transactions arrive chronologically (per spec), a single forward pass
@@ -41,13 +42,12 @@
 //! a chargeback happens the account should be immediately frozen.
 //!
 //! ## Pending-buffer eviction
-//! Deposits are buffered in an [`IndexMap`] (insertion-ordered) before being
-//! written to redb in batches. When the buffer reaches `max_pending` entries —
-//! derived from [`TX_MEMORY_ENV`] at startup — the **oldest 10 %** of entries
-//! (by arrival order) are evicted to redb in a single write transaction. The
-//! remaining 90 % stay in memory so recent deposits remain fast to look up.
-//! Dispute / resolve / chargeback handlers always check the in-memory buffer
-//! first, then fall through to the on-disk ledger.
+//! Deposits are buffered in an [`IndexMap`] (insertion-ordered). When the buffer
+//! reaches `max_pending` entries — derived from [`TX_MEMORY_ENV`] at startup —
+//! the **oldest 10 %** are evicted to the lazily-created redb file in a single
+//! write transaction. The remaining 90 % stay in memory so recent deposits remain
+//! fast to look up. Dispute / resolve / chargeback handlers always check the
+//! in-memory buffer first, then fall through to the on-disk ledger.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -241,16 +241,26 @@ impl AccountFsm {
 // Engine
 // ---------------------------------------------------------------------------
 
+/// Lazily-created redb backing store for the deposit ledger.
+///
+/// Created on the first call to [`Payments::flush_oldest`]. Field declaration
+/// order is load-bearing: `db` must be dropped before `_tmp` so the database
+/// handle is closed before its backing file is deleted.
+struct Spill {
+    db: Database,
+    _tmp: NamedTempFile,
+}
+
 /// The payment engine.
 ///
 /// Holds all derived state produced by replaying the event stream.
 /// Construct with [`Payments::new`], feed events with [`Payments::apply`],
 /// then call [`Payments::accounts`] to obtain the final account snapshots.
 ///
-/// The engine is intentionally synchronous. To support async ingestion (e.g.
-/// multiple TCP sockets), wrap event production in `tokio::task::spawn_blocking`
-/// or use a channel that feeds into a single-threaded engine loop — the engine
-/// itself needs no changes.
+/// The engine is intentionally synchronous. The parallel driver in
+/// `crate::parallel` spawns one `Payments` instance per client inside a
+/// tokio task, routing transactions by `client_id` so each instance only
+/// ever sees a single client's events.
 pub struct Payments {
     /// Derived account state, keyed by client ID.
     accounts: HashMap<u16, AccountFsm>,
@@ -264,69 +274,39 @@ pub struct Payments {
     ///
     /// [`IndexMap`] preserves insertion order, which lets `flush_oldest` evict
     /// the earliest entries first. Capped at `max_pending`; when that threshold
-    /// is reached the oldest 10 % are drained to redb while the remaining 90 %
-    /// stay in memory. Dispute / resolve / chargeback handlers consult this map
-    /// before the on-disk ledger, so a buffered deposit is always visible.
+    /// is reached the oldest 10 % are drained to the redb spill while the
+    /// remaining 90 % stay in memory.
     pending: IndexMap<u32, DepositRecord>,
 
     /// Maximum number of entries allowed in `pending` before a partial flush.
     ///
-    /// Computed from [`crate::env::TX_MEMORY_ENV`] at startup via [`crate::env::max_pending_from_env`].
-    max_pending: usize,
+    /// Computed from [`crate::env::TX_MEMORY_ENV`] at startup via
+    /// [`crate::env::max_pending_from_env`].
+    pub(crate) max_pending: usize,
 
-    // Field declaration order matters: Rust drops struct fields in declaration
-    // order. `db` must be dropped before `_tmp` so the database is closed
-    // before its backing file is deleted.
-    /// The redb database handle.
-    db: Database,
-
-    /// Temporary file that backs the redb database.
-    _tmp: NamedTempFile,
+    /// Lazily-created redb spill. `None` until the first buffer overflow.
+    spill: Option<Spill>,
 }
 
 impl Payments {
-    /// Create a new, empty engine backed by a temporary redb database.
+    /// Create a new, empty engine.
     ///
-    /// Reads [`TX_MEMORY_ENV`] to determine the pending-buffer size.
+    /// Reads [`crate::env::TX_MEMORY_ENV`] to determine the pending-buffer
+    /// size. The redb spill file is **not** created here; it is opened lazily
+    /// on the first buffer overflow.
     ///
     /// # Errors
     ///
-    /// Returns an error if the temporary file or the redb database cannot be
-    /// created, if the deposits table cannot be initialised, or if
-    /// [`TX_MEMORY_ENV`] contains an unparseable value.
+    /// Returns an error only if [`crate::env::TX_MEMORY_ENV`] is set but
+    /// contains an unparseable value.
     pub fn new() -> Result<Self> {
         let max_pending = env::max_pending_from_env(ENTRY_MEM_BYTES, DEFAULT_MAX_PENDING)?;
-
-        let dir = resolve_ledger_dir();
-        let tmp = Builder::new()
-            .prefix("pecrab-ledger-")
-            .tempfile_in(&dir)
-            .with_context(|| {
-                format!(
-                    "failed to create temporary ledger file in {}",
-                    dir.display()
-                )
-            })?;
-        let db = Database::create(tmp.path()).context("failed to open redb database")?;
-
-        // Eagerly initialise the table so subsequent read transactions can find
-        // it even before the first deposit has been written.
-        let mut txn = db
-            .begin_write()
-            .context("failed to begin initial write transaction")?;
-        txn.set_durability(Durability::None)?;
-        txn.open_table(DEPOSITS)
-            .context("failed to initialise deposits table")?;
-        txn.commit()
-            .context("failed to commit table initialisation")?;
-
         Ok(Self {
             accounts: HashMap::new(),
             disputed: HashSet::new(),
             pending: IndexMap::new(),
             max_pending,
-            db,
-            _tmp: tmp,
+            spill: None,
         })
     }
 
@@ -476,15 +456,19 @@ impl Payments {
 
     // -- redb helpers --------------------------------------------------------
 
-    /// Look up a deposit by tx ID — pending buffer first, then on-disk ledger.
+    /// Look up a deposit by tx ID — pending buffer first, then on-disk spill.
     ///
-    /// Used by dispute / resolve / chargeback handlers, which never mutate
-    /// the ledger.
+    /// Returns `Ok(None)` immediately when no spill exists yet, since every
+    /// deposit inserted before the first overflow is still in `pending`.
     fn lookup_deposit(&self, tx_id: u32) -> Result<Option<DepositRecord>> {
         if let Some(record) = self.pending.get(&tx_id) {
             return Ok(Some(record.clone()));
         }
-        let txn = self
+        let spill = match &self.spill {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let txn = spill
             .db
             .begin_read()
             .context("failed to begin read transaction")?;
@@ -497,13 +481,16 @@ impl Payments {
             .map(|guard| decode_record(guard.value())))
     }
 
-    /// Return `true` if `tx_id` is already present in the on-disk ledger.
+    /// Return `true` if `tx_id` is already present in the on-disk spill.
     ///
-    /// Pending buffer membership is checked separately by the caller — keeping
-    /// this method scoped to disk lookup makes the cost obvious at the call
-    /// site.
+    /// Returns `false` immediately when no spill exists yet — all deposits are
+    /// still in `pending`, which the caller already checked.
     fn db_contains(&self, tx_id: u32) -> Result<bool> {
-        let txn = self
+        let spill = match &self.spill {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+        let txn = spill
             .db
             .begin_read()
             .context("failed to begin read transaction")?;
@@ -516,7 +503,8 @@ impl Payments {
             .is_some())
     }
 
-    /// Evict the oldest 10 % of buffered deposits to redb.
+    /// Evict the oldest 10 % of buffered deposits to the redb spill store,
+    /// creating it lazily on the first call.
     ///
     /// Because [`IndexMap`] preserves insertion order, draining the front of
     /// the map yields exactly the entries that have been resident longest.
@@ -528,29 +516,60 @@ impl Payments {
             return Ok(());
         }
 
+        // Open the redb file the first time the buffer overflows.
+        if self.spill.is_none() {
+            self.spill = Some(Self::open_spill()?);
+        }
+
         // Evict at least one entry even when pending has fewer than 10 items.
         let flush_count = (self.pending.len() / 10).max(1);
 
-        let mut txn = self
-            .db
-            .begin_write()
-            .context("failed to begin write transaction")?;
-        txn.set_durability(Durability::None)?;
-        {
-            let mut table = txn
-                .open_table(DEPOSITS)
-                .context("failed to open deposits table")?;
-            // `drain(..flush_count)` removes the first `flush_count` entries in
-            // insertion order (the oldest arrivals) and yields them as an
-            // iterator — O(n) over the drained slice, no full-map rebuild.
-            for (tx_id, record) in self.pending.drain(..flush_count) {
-                table
-                    .insert(tx_id, encode_record(&record))
-                    .context("failed to insert deposit record")?;
+        if let Some(spill) = self.spill.as_mut() {
+            let mut txn = spill
+                .db
+                .begin_write()
+                .context("failed to begin write transaction")?;
+            txn.set_durability(Durability::None)?;
+            {
+                let mut table = txn
+                    .open_table(DEPOSITS)
+                    .context("failed to open deposits table")?;
+                // `drain(..flush_count)` removes the first `flush_count` entries in
+                // insertion order (the oldest arrivals) and yields them as an
+                // iterator — O(n) over the drained slice, no full-map rebuild.
+                for (tx_id, record) in self.pending.drain(..flush_count) {
+                    table
+                        .insert(tx_id, encode_record(&record))
+                        .context("failed to insert deposit record")?;
+                }
             }
+            txn.commit().context("failed to commit deposit batch")?;
         }
-        txn.commit().context("failed to commit deposit batch")?;
         Ok(())
+    }
+
+    /// Create and initialise a fresh redb spill file.
+    fn open_spill() -> Result<Spill> {
+        let dir = resolve_ledger_dir();
+        let tmp = Builder::new()
+            .prefix("pecrab-ledger-")
+            .tempfile_in(&dir)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary ledger file in {}",
+                    dir.display()
+                )
+            })?;
+        let db = Database::create(tmp.path()).context("failed to open redb database")?;
+        let mut txn = db
+            .begin_write()
+            .context("failed to begin initial write transaction")?;
+        txn.set_durability(Durability::None)?;
+        txn.open_table(DEPOSITS)
+            .context("failed to initialise deposits table")?;
+        txn.commit()
+            .context("failed to commit table initialisation")?;
+        Ok(Spill { db, _tmp: tmp })
     }
 }
 
