@@ -66,12 +66,22 @@ This isolates resource usage from the rest of the system and allows the run to b
 
 ```bash
 cargo build --release
-sudo systemd-run --scope \
+sudo systemd-run --unit=pecrab \
+    --scope \
     -p MemoryMax=4G \
     -p CPUQuota=80% \
     /usr/bin/time -v \
     ./target/release/pe_crab tests/sample_99_max_amount_of_transactions.csv \
     > sample_99_out.csv
+```
+
+Monitoring with:
+```bash
+systemd-cgtop /system.slice/pecrab.scope
+```
+Or:
+```bash
+systemctl status pecrab
 ```
 
 So far, without running on a systemd scope, the application get's killed by the OOM killer.
