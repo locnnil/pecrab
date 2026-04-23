@@ -117,6 +117,9 @@ This would break the buffering model
 The last approach is the one implemented in the current version of the application, and it works well for the test cases (1k, 100k, 1M, 100M and 500M transactions).
 The amount of memory used is kept constant around 2GB, due to the constraint in code of keeping up to 50M in memory, and flushing to disk after this number.
 
+#### Improvements on the current implementation
+
+- **Batching transactions**: Instead of hardcoding the number of transactions to keep in memory and flush to disk everything after this number, I decided to implement a batching mechanism that allows keep in memory the newer transactions and flush the 10% of the oldest transactions to disk.
 #### Parallelization
 
 Since the application is currently single-threaded, it can be parallelized by using multiple threads to process the transactions in parallel.

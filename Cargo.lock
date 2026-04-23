@@ -526,6 +526,7 @@ dependencies = [
  "anyhow",
  "criterion",
  "csv",
+ "indexmap",
  "redb",
  "rust_decimal",
  "rust_decimal_macros",

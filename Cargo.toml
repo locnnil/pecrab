@@ -18,6 +18,7 @@ use_self = "warn"
 [dependencies]
 anyhow = "1.0.102"
 csv = "1.4.0"
+indexmap = "2.1"
 redb = "4.1.0"
 rust_decimal = "1.41.0"
 rust_decimal_macros = "1.40.0"

@@ -39,6 +39,15 @@
 //!
 //! Any mutating operation on a `Locked` account is silently ignored, because once
 //! a chargeback happens the account should be immediately frozen.
+//!
+//! ## Pending-buffer eviction
+//! Deposits are buffered in an [`IndexMap`] (insertion-ordered) before being
+//! written to redb in batches. When the buffer reaches `max_pending` entries —
+//! derived from [`TX_MEMORY_ENV`] at startup — the **oldest 10 %** of entries
+//! (by arrival order) are evicted to redb in a single write transaction. The
+//! remaining 90 % stay in memory so recent deposits remain fast to look up.
+//! Dispute / resolve / chargeback handlers always check the in-memory buffer
+//! first, then fall through to the on-disk ledger.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -46,12 +55,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use indexmap::IndexMap;
 use redb::{Database, Durability, ReadableDatabase, TableDefinition};
 use rust_decimal::Decimal;
 use tempfile::{Builder, NamedTempFile};
 
 use crate::models::{Account, TransactionInfo, TransactionType};
 
+use crate::env;
 // ---------------------------------------------------------------------------
 // On-disk table
 // ---------------------------------------------------------------------------
@@ -63,21 +74,6 @@ use crate::models::{Account, TransactionInfo, TransactionType};
 ///   `[0..2]` = client (u16, little-endian) | `[2..18]` = amount (Decimal
 ///   16-byte serialisation via [`rust_decimal::Decimal::serialize`])
 const DEPOSITS: TableDefinition<u32, [u8; 18]> = TableDefinition::new("deposits");
-
-/// Number of deposits to buffer in memory before flushing to redb.
-///
-/// redb is a copy-on-write B-tree: every commit allocates fresh pages along
-/// the modified path (~4–5 × 4KB ≈ 16KB of write amplification), independent
-/// of payload size. Per-event commits therefore inflate both runtime and disk
-/// usage by orders of magnitude (observed: 10M deposits → 150GB on-disk,
-/// >40min). Batching amortises that cost across many inserts.
-///
-/// Tuning: larger values reduce per-commit overhead but increase peak memory
-/// (each pending entry is ~50 bytes including HashMap overhead) and lengthen
-/// the window during which a referenced deposit is invisible to read
-/// transactions; though that is masked by the in-memory pending lookup, so
-/// only the memory cost is a real ceiling.
-const COMMIT_BATCH_SIZE: usize = 50_000_000;
 
 /// Encode a [`DepositRecord`] into 18 bytes for redb storage.
 fn encode_record(r: &DepositRecord) -> [u8; 18] {
@@ -117,6 +113,19 @@ struct DepositRecord {
     client: u16,
     amount: Decimal,
 }
+
+/// Approximate memory cost per pending-buffer entry: tx-ID key (`u32`) plus
+/// deposit-record value (`DepositRecord`). Does not include `IndexMap`'s
+/// internal hash-table overhead (~4–8 bytes per slot on 64-bit), so effective
+/// peak RSS will be modestly higher. The formula gives operators a simple,
+/// predictable mental model when sizing [`crate::env::TX_MEMORY_ENV`].
+const ENTRY_MEM_BYTES: usize = std::mem::size_of::<u32>() + std::mem::size_of::<DepositRecord>();
+
+/// Default pending-buffer entry cap when [`TX_MEMORY_ENV`] is unset.
+///
+/// Matches the legacy hard-coded batch size so existing deployments that do not
+/// set the environment variable see no behaviour change.
+const DEFAULT_MAX_PENDING: usize = 50_000_000;
 
 /// Per-account state machine.
 ///
@@ -251,13 +260,19 @@ pub struct Payments {
     /// Kept in memory for O(1) membership tests without a disk lookup.
     disputed: HashSet<u32>,
 
-    /// Deposits observed but not yet flushed to redb.
+    /// Deposits buffered in memory, ordered by arrival time.
     ///
-    /// Capped at [`COMMIT_BATCH_SIZE`]; flushed in a single redb write
-    /// transaction once full. Read paths (dispute / resolve / chargeback)
-    /// consult this map first, so an unflushed deposit is still visible to
-    /// the referencing event.
-    pending: HashMap<u32, DepositRecord>,
+    /// [`IndexMap`] preserves insertion order, which lets `flush_oldest` evict
+    /// the earliest entries first. Capped at `max_pending`; when that threshold
+    /// is reached the oldest 10 % are drained to redb while the remaining 90 %
+    /// stay in memory. Dispute / resolve / chargeback handlers consult this map
+    /// before the on-disk ledger, so a buffered deposit is always visible.
+    pending: IndexMap<u32, DepositRecord>,
+
+    /// Maximum number of entries allowed in `pending` before a partial flush.
+    ///
+    /// Computed from [`crate::env::TX_MEMORY_ENV`] at startup via [`crate::env::max_pending_from_env`].
+    max_pending: usize,
 
     // Field declaration order matters: Rust drops struct fields in declaration
     // order. `db` must be dropped before `_tmp` so the database is closed
@@ -272,11 +287,16 @@ pub struct Payments {
 impl Payments {
     /// Create a new, empty engine backed by a temporary redb database.
     ///
+    /// Reads [`TX_MEMORY_ENV`] to determine the pending-buffer size.
+    ///
     /// # Errors
     ///
     /// Returns an error if the temporary file or the redb database cannot be
-    /// created, or if the deposits table cannot be initialised.
+    /// created, if the deposits table cannot be initialised, or if
+    /// [`TX_MEMORY_ENV`] contains an unparseable value.
     pub fn new() -> Result<Self> {
+        let max_pending = env::max_pending_from_env(ENTRY_MEM_BYTES, DEFAULT_MAX_PENDING)?;
+
         let dir = resolve_ledger_dir();
         let tmp = Builder::new()
             .prefix("pecrab-ledger-")
@@ -303,7 +323,8 @@ impl Payments {
         Ok(Self {
             accounts: HashMap::new(),
             disputed: HashSet::new(),
-            pending: HashMap::with_capacity(COMMIT_BATCH_SIZE),
+            pending: IndexMap::new(),
+            max_pending,
             db,
             _tmp: tmp,
         })
@@ -355,8 +376,8 @@ impl Payments {
         );
         self.account_mut(event.client).apply_deposit(amount);
 
-        if self.pending.len() >= COMMIT_BATCH_SIZE {
-            self.flush()?;
+        if self.pending.len() >= self.max_pending {
+            self.flush_oldest()?;
         }
         Ok(())
     }
@@ -495,16 +516,20 @@ impl Payments {
             .is_some())
     }
 
-    /// Drain the pending buffer into redb in a single write transaction.
+    /// Evict the oldest 10 % of buffered deposits to redb.
     ///
-    /// Opens the deposits table once, inserts every buffered record, then
-    /// commits. With [`Durability::None`] the commit is memory-only (no
-    /// fsync). Called automatically when the buffer reaches
-    /// [`COMMIT_BATCH_SIZE`].
-    fn flush(&mut self) -> Result<()> {
+    /// Because [`IndexMap`] preserves insertion order, draining the front of
+    /// the map yields exactly the entries that have been resident longest.
+    /// A single redb write transaction covers all evicted records, keeping
+    /// per-commit overhead low. After the call, `pending` retains ~90 % of
+    /// its previous entries and is ready to accept new deposits.
+    fn flush_oldest(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
+
+        // Evict at least one entry even when pending has fewer than 10 items.
+        let flush_count = (self.pending.len() / 10).max(1);
 
         let mut txn = self
             .db
@@ -515,7 +540,10 @@ impl Payments {
             let mut table = txn
                 .open_table(DEPOSITS)
                 .context("failed to open deposits table")?;
-            for (tx_id, record) in self.pending.drain() {
+            // `drain(..flush_count)` removes the first `flush_count` entries in
+            // insertion order (the oldest arrivals) and yields them as an
+            // iterator — O(n) over the drained slice, no full-map rebuild.
+            for (tx_id, record) in self.pending.drain(..flush_count) {
                 table
                     .insert(tx_id, encode_record(&record))
                     .context("failed to insert deposit record")?;
@@ -636,6 +664,47 @@ mod tests {
 
     fn accounts_map(engine: Payments) -> HashMap<u16, Account> {
         engine.accounts().map(|a| (a.client, a)).collect()
+    }
+
+    // -- flush_oldest (via small max_pending) --------------------------------
+
+    /// Build an engine whose pending buffer holds at most `cap` entries.
+    fn engine_with_cap(cap: usize) -> Payments {
+        let mut e = Payments::new().unwrap();
+        e.max_pending = cap;
+        e
+    }
+
+    #[test]
+    fn flush_oldest_evicts_to_redb_and_deposit_still_disputable() {
+        // cap=1 so the very first deposit triggers an immediate flush.
+        let mut e = engine_with_cap(1);
+        e.apply(deposit(1, 1, dec!(100.0))).unwrap();
+
+        // After flush, tx 1 must be findable via the on-disk ledger.
+        e.apply(dispute(1, 1)).unwrap();
+
+        let accounts = accounts_map(e);
+        assert_eq!(accounts[&1].held, dec!(100.0));
+    }
+
+    #[test]
+    fn flush_oldest_keeps_newer_entries_in_memory() {
+        // cap=2: filling to 2 flushes 1 (10 % rounded up), keeping 1 in memory.
+        let mut e = engine_with_cap(2);
+        e.apply(deposit(1, 1, dec!(10.0))).unwrap();
+        e.apply(deposit(1, 2, dec!(20.0))).unwrap(); // triggers flush of tx 1
+
+        // tx 1 must be in redb now; tx 2 must still be in pending.
+        assert!(!e.pending.contains_key(&1));
+        assert!(e.pending.contains_key(&2));
+
+        // Both deposits must still be disputable.
+        e.apply(dispute(1, 1)).unwrap();
+        e.apply(dispute(1, 2)).unwrap();
+
+        let accounts = accounts_map(e);
+        assert_eq!(accounts[&1].held, dec!(30.0));
     }
 
     // -- Deposit -------------------------------------------------------------

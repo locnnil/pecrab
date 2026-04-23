@@ -6,6 +6,7 @@ pub mod models;
 
 pub use engine::Payments;
 mod engine;
+mod env;
 mod errors;
 
 use crate::{errors::EngineError, models::TransactionInfo};
