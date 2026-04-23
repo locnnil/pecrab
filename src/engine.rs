@@ -49,10 +49,7 @@
 //! fast to look up. Dispute / resolve / chargeback handlers always check the
 //! in-memory buffer first, then fall through to the on-disk ledger.
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-};
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
@@ -60,9 +57,9 @@ use redb::{Database, Durability, ReadableDatabase, TableDefinition};
 use rust_decimal::Decimal;
 use tempfile::{Builder, NamedTempFile};
 
-use crate::models::{Account, TransactionInfo, TransactionType};
-
 use crate::env;
+use crate::env::resolve_ledger_dir;
+use crate::models::{Account, TransactionInfo, TransactionType};
 // ---------------------------------------------------------------------------
 // On-disk table
 // ---------------------------------------------------------------------------
@@ -576,42 +573,6 @@ impl Payments {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Environment variable that overrides the directory used to host the redb
-/// ledger file. Useful for steering the ledger onto a specific scratch volume
-/// (e.g. an NVMe disk) in production.
-const LEDGER_DIR_ENV: &str = "PECRAB_LEDGER_DIR";
-
-/// Resolve the directory in which to place the ephemeral ledger file.
-///
-/// Resolution order:
-/// 1. `PECRAB_LEDGER_DIR` environment variable — explicit operator override.
-/// 2. `/var/tmp` — per the FHS, must be preserved across reboots, so distros
-///    conventionally back it with disk (unlike `/tmp`, which is `tmpfs` on
-///    most modern systemd-default installations).
-/// 3. [`std::env::temp_dir`] — last resort. Logs a warning to stderr because
-///    this is typically `/tmp`, which on many distributions is RAM-backed —
-///    defeating the point of spilling the ledger to disk.
-fn resolve_ledger_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os(LEDGER_DIR_ENV) {
-        return PathBuf::from(dir);
-    }
-
-    let var_tmp = PathBuf::from("/var/tmp");
-    if var_tmp.is_dir() {
-        return var_tmp;
-    }
-
-    let fallback = std::env::temp_dir();
-    eprintln!(
-        "warning: /var/tmp is not available; falling back to {} for the ledger file. \
-         This directory may be tmpfs (RAM-backed), which would defeat the purpose of \
-         spilling the ledger to disk. Set {} to a disk-backed directory to silence this warning.",
-        fallback.display(),
-        LEDGER_DIR_ENV,
-    );
-    fallback
-}
 
 /// Extract the `amount` field from an event that requires one (deposit,
 /// withdrawal). Returns `Err` if the field is absent — that signals a

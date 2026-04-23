@@ -4,6 +4,43 @@
 //! Environment-variable helpers for runtime configuration.
 
 use anyhow::{Context, Result, bail};
+use std::path::PathBuf;
+
+/// Environment variable that overrides the directory used to host the redb
+/// ledger file. Useful for steering the ledger onto a specific scratch volume
+/// (e.g. an NVMe disk) in production.
+const LEDGER_DIR_ENV: &str = "PECRAB_LEDGER_DIR";
+
+/// Resolve the directory in which to place the ephemeral ledger file.
+///
+/// Resolution order:
+/// 1. `PECRAB_LEDGER_DIR` environment variable — explicit operator override.
+/// 2. `/var/tmp` — per the FHS, must be preserved across reboots, so distros
+///    conventionally back it with disk (unlike `/tmp`, which is `tmpfs` on
+///    most modern systemd-default installations).
+/// 3. [`std::env::temp_dir`] — last resort. Logs a warning to stderr because
+///    this is typically `/tmp`, which on many distributions is RAM-backed —
+///    defeating the point of spilling the ledger to disk.
+pub fn resolve_ledger_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(LEDGER_DIR_ENV) {
+        return PathBuf::from(dir);
+    }
+
+    let var_tmp = PathBuf::from("/var/tmp");
+    if var_tmp.is_dir() {
+        return var_tmp;
+    }
+
+    let fallback = std::env::temp_dir();
+    eprintln!(
+        "warning: /var/tmp is not available; falling back to {} for the ledger file. \
+         This directory may be tmpfs (RAM-backed), which would defeat the purpose of \
+         spilling the ledger to disk. Set {} to a disk-backed directory to silence this warning.",
+        fallback.display(),
+        LEDGER_DIR_ENV,
+    );
+    fallback
+}
 
 // ---------------------------------------------------------------------------
 // Pending-buffer configuration
@@ -17,7 +54,7 @@ use anyhow::{Context, Result, bail};
 ///
 /// When unset the engine falls back to the `default` passed to
 /// [`max_pending_from_env`].
-pub const TX_MEMORY_ENV: &str = "PECRAB_TX_MEMORY_MAX";
+pub const TX_MEMORY_ENV: &str = "PECRAB_ACTOR_MEMORY_LIMIT_BYTES";
 
 /// Parse a human-readable byte count with an optional SI suffix.
 ///
