@@ -126,3 +126,43 @@ Since the application is currently single-threaded, it can be parallelized by us
 One of the assumptions is that transactions are isolated by client, so we can process transactions of different clients in parallel without worrying about race conditions.
 One possible approach is to use a dispatcher thread that reads the transactions from the file and dispatches them to worker threads based on the client id.
 Each worker thread would then process the transactions for its assigned clients and update the accounts accordingly.
+
+**Approaches to parallelization**:
+
+- One reDB tempfile per client; ReDB MVCC allows concurrent reads but only a single writer at a time, so to avoid dealing with write mutex locks, each client ID get's it's own ReDB instance _when needed_.
+- ReDB: implement lazy initialization, to avoid file descriptor exhaustion ([EMFILE](https://man7.org/linux/man-pages/man3/fopen.3p.html#ERRORS)), the ReDB tempfile is only created when a given client ID reaches the quote for the in-memory allowed transactions. Calculated by the
+- One actor/worker per client: Since client transactions are independents, and the assumption is that each client has only one account, we can parallelized the transactions processing by client.
+
+**Results of parallelization**:
+
+- Benchmark results show increase in throughput of +2515.9% for sample_01 and +1941.3% for sample_05:
+
+```log
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running benches/engine.rs (target/release/deps/engine-c29c0f29c109089c)
+Benchmarking pecrab_engine/sample_01: Warming up for 3.0000 s
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 5.3s, enable flat sampling, or reduce sample count to 60.
+pecrab_engine/sample_01 time:   [1.0485 ms 1.0516 ms 1.0553 ms]
+                        thrpt:  [116.60 KiB/s 117.01 KiB/s 117.36 KiB/s]
+                 change:
+                        time:   [−96.548% −96.177% −95.774%] (p = 0.00 < 0.05)
+                        thrpt:  [+2266.4% +2515.9% +2796.5%]
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  2 (2.00%) low mild
+  4 (4.00%) high severe
+Benchmarking pecrab_engine/sample_05: Warming up for 3.0000 s
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 5.3s, enable flat sampling, or reduce sample count to 60.
+pecrab_engine/sample_05 time:   [1.0479 ms 1.0520 ms 1.0570 ms]
+                        thrpt:  [345.54 KiB/s 347.17 KiB/s 348.52 KiB/s]
+                 change:
+                        time:   [−95.149% −95.101% −95.054%] (p = 0.00 < 0.05)
+                        thrpt:  [+1921.8% +1941.3% +1961.3%]
+                        Performance has improved.
+Found 9 outliers among 100 measurements (9.00%)
+  2 (2.00%) low severe
+  3 (3.00%) high mild
+  4 (4.00%) high severe
+```
+
