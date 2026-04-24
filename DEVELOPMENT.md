@@ -30,14 +30,14 @@ and a warning is emitted to stderr.
 
 ## Engine Evolution
 
-### Generation 1 — Naive In-Memory (Single-Tier)
+### Generation 1 — Naive In-Memory (Single-Tier) · [v1.0](https://github.com/locnnil/pecrab/releases/tag/v1.0)
 
 The first implementation stored the full deposit history in a single `HashMap<u32,
 TransactionInfo>` in memory. This is simple and fast for small inputs, but when transaction
 counts approach the u32 limit (~4.3 billion rows) the process is killed by the Linux OOM killer
 long before completion.
 
-### Generation 2 — Two-Tier Storage (In-Memory + redb Spill)
+### Generation 2 — Two-Tier Storage (In-Memory + redb Spill) · [v2.0](https://github.com/locnnil/pecrab/releases/tag/v2.0)
 
 To survive large inputs, a second storage tier was introduced: when the in-memory map exceeded a
 fixed entry count, the entire map was flushed to a [redb](https://crates.io/crates/redb)
@@ -48,7 +48,7 @@ The main drawbacks were:
 - The hard flush threshold caused a sudden burst of disk I/O.
 - Flushing the entire map at once discarded entries that were likely still needed.
 
-### Generation 3 — IndexMap + 1:10 Incremental Spill
+### Generation 3 — IndexMap + 1:10 Incremental Spill · [v2.1](https://github.com/locnnil/pecrab/releases/tag/v2.1)
 
 The `HashMap` was replaced with an [`IndexMap`](https://crates.io/crates/indexmap), which
 preserves insertion order. Instead of flushing everything when the cap was hit, only the oldest
@@ -56,7 +56,7 @@ preserves insertion order. Instead of flushing everything when the cap was hit, 
 — recent deposits stay hot in memory, older ones spill to disk — and spreads the I/O cost across
 many small flushes rather than one large one.
 
-### Generation 4 — Parallel Execution with Tokio (Per-Actor redb)
+### Generation 4 — Parallel Execution with Tokio (Per-Actor redb) · [v3.0](https://github.com/locnnil/pecrab/releases/tag/v3.0)
 
 Sequential processing became the bottleneck. Since each client's transactions are independent, a
 Tokio-based dispatcher was introduced: a blocking thread reads the CSV and sends each row to a
@@ -77,7 +77,7 @@ pecrab_engine/sample_05   time: [1.05 ms]   thrpt: [347 KiB/s]
                           change: −95.1 %   thrpt: +1941.3 %
 ```
 
-### Generation 5 — Global Memory Budget with Soft/Hard Watermarks (Current)
+### Generation 5 — Global Memory Budget with Soft/Hard Watermarks · [v3.1](https://github.com/locnnil/pecrab/releases/tag/v3.1)
 
 With N actors each holding a static per-actor limit in memory, the aggregate footprint can
 reach N × per-actor limit — easily exceeding physical RAM with the full u16 client space
