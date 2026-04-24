@@ -137,6 +137,7 @@ the system:
 cargo build --release
 sudo systemd-run --unit=pecrab \
     --scope \
+    -p MemorySwapMax=0 \
     -p MemoryMax=4G \
     -p CPUQuota=80% \
     /usr/bin/time -v \
