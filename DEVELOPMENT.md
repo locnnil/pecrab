@@ -125,8 +125,8 @@ echo 'client,available,held,total,locked' > sample_00_out.csv
 echo "1,4294967294.0000,0.0000,4294967294.0000,false" >> sample_00_out.csv
 ```
 
-> **Warning:** The resulting file is approximately **111 GB**. It is not included in the
-> repository. Generation takes significant time.
+> [!WARNING]The resulting file is approximately **111 GB**. It is not included in the repository.
+> Generation takes significant time.
 
 ### Running Under a Memory and CPU Cap
 
@@ -175,5 +175,3 @@ Pre-generated samples included in the repository:
 | `sample_14_max_clients.csv`         | 65 535 000   | ~1.3 GB   |
 | `sample_16_1B_transactions.csv`     | 1 000 000 000| not in VCS|
 
-> **Warning:** Shell brace expansion (`{1..N}`) generates the full sequence in memory before
-> execution. For N > ~10 million use `seq` or `awk` instead, as shown in the commands above.

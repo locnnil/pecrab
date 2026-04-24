@@ -144,7 +144,7 @@ Example — generate a sample with 500 clients and 2 000 deposits each (1 000 00
 ./tests/generate_sample.sh 20_big_test 500 2000
 ```
 
-> **Note:** The script uses `shuf` to randomise row order, which loads all rows into memory.
+> [!Note:] The script uses `shuf` to randomise row order, which loads all rows into memory.
 
 ### Benchmarks
 
