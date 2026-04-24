@@ -134,7 +134,7 @@ the system:
 
 ```bash
 cargo build --release
-sudo systemd-run --unit=pecrab \
+systemd-run --user --unit=pecrab \
     --scope \
     -p MemorySwapMax=0 \
     -p MemoryMax=4G \
@@ -147,9 +147,9 @@ sudo systemd-run --unit=pecrab \
 Monitor while running:
 
 ```bash
-systemd-cgtop /system.slice/pecrab.scope
+systemd-cgtop /user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/pecrab.scope
 # or/and
-systemctl status pecrab
+systemctl --user status pecrab.scope
 ```
 
 ### Multi-Client Stress Samples
