@@ -181,6 +181,10 @@ fn all_samples_parallel() {
     let mut failures: Vec<String> = Vec::new();
 
     for (input, expected) in &pairs {
+        eprintln!(
+            "running sample: {}",
+            input.file_name().unwrap().to_str().unwrap()
+        );
         let result = std::panic::catch_unwind(|| run_sample_parallel(input, expected));
         if let Err(e) = result {
             let msg = e
