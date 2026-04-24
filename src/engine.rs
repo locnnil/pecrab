@@ -341,6 +341,10 @@ impl Payments {
         // ledger. Tx IDs are globally unique per spec, so a hit here means
         // the partner re-sent the same event and we silently skip it.
         if self.pending.contains_key(&event.tx) || self.db_contains(event.tx)? {
+            eprintln!(
+                "duplicate tx {} ignored: already exists in pending buffer or on-disk ledger",
+                event.tx
+            );
             return Ok(());
         }
 
