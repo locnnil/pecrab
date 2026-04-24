@@ -6,10 +6,12 @@ pub mod models;
 
 pub use engine::Payments;
 pub use errors::EngineError;
+pub use mem_budget::{GlobalMemBudget, MemPressure};
 pub use parallel::run_with_writer_parallel;
 mod engine;
 mod env;
 mod errors;
+mod mem_budget;
 mod parallel;
 
 use crate::models::TransactionInfo;

@@ -93,11 +93,11 @@ pub fn parse_si_bytes(s: &str) -> Result<u64> {
     let value: u64 = num_str
         .trim()
         .parse()
-        .with_context(|| format!("invalid number in {TX_MEMORY_ENV}: '{num_str}'"))?;
+        .with_context(|| format!("invalid numeric prefix '{num_str}'"))?;
 
     value
         .checked_mul(multiplier)
-        .with_context(|| format!("{TX_MEMORY_ENV} value overflows u64"))
+        .context("byte value overflows u64")
 }
 
 /// Read [`TX_MEMORY_ENV`] and compute the maximum number of pending entries.
@@ -126,6 +126,49 @@ pub fn max_pending_from_env(entry_size: usize, default: usize) -> Result<usize> 
 
     // Guard against a budget so small that the engine flushes on every deposit.
     Ok(max.max(1))
+}
+
+// ---------------------------------------------------------------------------
+// Global memory budget configuration
+// ---------------------------------------------------------------------------
+
+/// Environment variable that caps the **aggregate** memory held in the pending
+/// buffers of all actors combined.
+///
+/// [`TX_MEMORY_ENV`] sizes a *single* actor; this variable bounds the *sum*
+/// across the actor pool. Without it, N actors × `TX_MEMORY_ENV` can exceed
+/// physical RAM and invite the OOM killer. Accepts the same SI-suffixed
+/// format as [`TX_MEMORY_ENV`] (see [`parse_si_bytes`]).
+pub const GLOBAL_MEMORY_ENV: &str = "PECRAB_GLOBAL_MEMORY_LIMIT";
+
+/// Default aggregate budget when [`GLOBAL_MEMORY_ENV`] is unset (2 GB).
+///
+/// Sized to comfortably hold the full u16 client space (65 535 clients) with
+/// a reasonable per-client deposit history before forcing disk spills.
+/// Operators may override via [`GLOBAL_MEMORY_ENV`].
+pub const DEFAULT_GLOBAL_MEMORY_LIMIT: usize = 2_000_000_000;
+
+/// Read [`GLOBAL_MEMORY_ENV`] and return the aggregate budget in bytes.
+///
+/// Falls back to `default` when the variable is unset.
+///
+/// # Errors
+///
+/// Returns an error if the variable is set but cannot be parsed, or if the
+/// resulting byte count overflows `usize`.
+pub fn global_mem_limit_from_env(default: usize) -> Result<usize> {
+    let bytes = match std::env::var(GLOBAL_MEMORY_ENV) {
+        Ok(val) => parse_si_bytes(&val)
+            .with_context(|| format!("failed to parse {GLOBAL_MEMORY_ENV}={val:?}"))?,
+        Err(std::env::VarError::NotPresent) => return Ok(default),
+        Err(std::env::VarError::NotUnicode(s)) => {
+            bail!("{GLOBAL_MEMORY_ENV} is not valid UTF-8: {s:?}")
+        }
+    };
+
+    bytes
+        .try_into()
+        .with_context(|| format!("{GLOBAL_MEMORY_ENV} value overflows usize"))
 }
 
 // ---------------------------------------------------------------------------

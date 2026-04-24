@@ -32,28 +32,43 @@
 //!
 //! # Memory
 //!
-//! [`Payments::new`] reads [`crate::env::TX_MEMORY_ENV`] to size its pending
-//! buffer. Each actor reads the variable once at creation time, so all actors
-//! share the same per-actor budget. The redb spill file is created lazily by
-//! each actor only if it actually overflows its buffer.
+//! [`Payments::new`] reads [`crate::env::TX_MEMORY_ENV`] to size its local
+//! pending buffer — the *per-actor* ceiling. To prevent the sum of those
+//! ceilings from dwarfing RAM when thousands of clients are active, every
+//! actor shares a single [`GlobalMemBudget`] sized by
+//! [`crate::env::GLOBAL_MEMORY_ENV`]. The dispatcher constructs the budget
+//! once and hands each actor a clone of the `Arc`; every pending-buffer
+//! insertion reserves against it and every flush releases the bytes drained.
+//!
+//! The redb spill file remains lazy and per-actor — only actors that actually
+//! overflow their buffer touch disk.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::Arc;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 
 use crate::engine::Payments;
+use crate::env;
 use crate::errors::EngineError;
+use crate::mem_budget::GlobalMemBudget;
 use crate::models::{Account, TransactionInfo};
 use crate::parse_transactions;
 
 /// Run one [`Payments`] engine as an actor, draining `rx` until it is closed.
 ///
+/// `budget` is the shared aggregate memory tracker; every actor holds a clone
+/// of the same `Arc` so reservations contend on one counter.
+///
 /// Returns all accounts seen by this actor (one per client in practice, since
 /// the dispatcher routes by `client_id`).
-async fn run_actor(mut rx: UnboundedReceiver<TransactionInfo>) -> Vec<Account> {
-    let mut engine = match Payments::new() {
+async fn run_actor(
+    mut rx: UnboundedReceiver<TransactionInfo>,
+    budget: Arc<GlobalMemBudget>,
+) -> Vec<Account> {
+    let mut engine = match Payments::new(budget) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("failed to initialise actor engine: {e}");
@@ -89,6 +104,13 @@ async fn dispatch<R: Read + Send + 'static, W: Write>(
     reader: R,
     writer: W,
 ) -> Result<(), EngineError> {
+    // Aggregate memory ceiling shared by every actor. Constructed once here
+    // and cloned into each spawned actor so reservations contend on a single
+    // atomic counter (see `crate::mem_budget`).
+    let global_limit = env::global_mem_limit_from_env(env::DEFAULT_GLOBAL_MEMORY_LIMIT)
+        .map_err(|e| EngineError::ConfigError(e.to_string()))?;
+    let budget = Arc::new(GlobalMemBudget::new(global_limit));
+
     let mut actor_senders: HashMap<u16, UnboundedSender<TransactionInfo>> = HashMap::new();
     let mut handles: Vec<JoinHandle<Vec<Account>>> = Vec::new();
 
@@ -110,8 +132,9 @@ async fn dispatch<R: Read + Send + 'static, W: Write>(
                 let client = tx.client;
                 let sender = actor_senders.entry(client).or_insert_with(|| {
                     let (s, r) = unbounded_channel();
-                    // Spawn a new actor task for this client.
-                    handles.push(tokio::spawn(run_actor(r)));
+                    // Spawn a new actor task for this client, handing it a
+                    // clone of the shared budget Arc.
+                    handles.push(tokio::spawn(run_actor(r, Arc::clone(&budget))));
                     s
                 });
                 if sender.send(tx).is_err() {

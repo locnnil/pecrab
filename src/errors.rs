@@ -35,4 +35,15 @@ pub enum EngineError {
     /// The tokio runtime could not be constructed.
     #[error("runtime error: {0}")]
     RuntimeError(String),
+
+    /// A configuration value (typically from an environment variable) could
+    /// not be parsed or was out of range.
+    #[error("configuration error: {0}")]
+    ConfigError(String),
+
+    /// The payment engine could not be constructed — typically because an
+    /// environment variable that sizes its internal buffers was set to an
+    /// invalid value.
+    #[error("engine initialisation error: {0}")]
+    EngineInitError(String),
 }

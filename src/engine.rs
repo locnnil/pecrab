@@ -48,8 +48,17 @@
 //! write transaction. The remaining 90 % stay in memory so recent deposits remain
 //! fast to look up. Dispute / resolve / chargeback handlers always check the
 //! in-memory buffer first, then fall through to the on-disk ledger.
+//!
+//! ## Aggregate memory budget
+//! `max_pending` caps a *single* actor. With thousands of clients, the sum of
+//! per-actor ceilings can dwarf physical RAM. A shared
+//! [`crate::mem_budget::GlobalMemBudget`] — passed in via [`Payments::new`] —
+//! tracks the aggregate bytes held across every actor and refuses reservations
+//! that would cross the hard ceiling. Under elevated pressure actors flush
+//! preemptively (Behavior B) so the ceiling is rarely hit at all.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
@@ -59,6 +68,8 @@ use tempfile::{Builder, NamedTempFile};
 
 use crate::env;
 use crate::env::resolve_ledger_dir;
+use crate::errors::EngineError;
+use crate::mem_budget::{GlobalMemBudget, MemPressure};
 use crate::models::{Account, TransactionInfo, TransactionType};
 // ---------------------------------------------------------------------------
 // On-disk table
@@ -275,35 +286,49 @@ pub struct Payments {
     /// remaining 90 % stay in memory.
     pending: IndexMap<u32, DepositRecord>,
 
-    /// Maximum number of entries allowed in `pending` before a partial flush.
+    /// Hard upper bound on entries allowed in `pending` for this actor.
     ///
-    /// Computed from [`crate::env::TX_MEMORY_ENV`] at startup via
-    /// [`crate::env::max_pending_from_env`].
+    /// Computed from [`crate::env::TX_MEMORY_ENV`] at startup. Serves as a
+    /// ceiling: the *effective* post-insert flush threshold is
+    /// `min(max_pending, budget.suggested_per_actor_cap(ENTRY_MEM_BYTES))`,
+    /// so the global memory budget — divided fairly across all live actors —
+    /// is always the binding constraint when many clients are active.
     pub(crate) max_pending: usize,
 
     /// Lazily-created redb spill. `None` until the first buffer overflow.
     spill: Option<Spill>,
+
+    /// Shared aggregate memory tracker. See [`crate::mem_budget`].
+    ///
+    /// Every pending-buffer insertion reserves [`ENTRY_MEM_BYTES`] from this
+    /// budget; every flush releases the bytes it drained. The `Arc` is cloned
+    /// by `crate::parallel` when spawning each per-client actor so every
+    /// actor contends on the same counter.
+    budget: Arc<GlobalMemBudget>,
 }
 
 impl Payments {
-    /// Create a new, empty engine.
+    /// Create a new, empty engine bound to the shared aggregate memory budget.
     ///
-    /// Reads [`crate::env::TX_MEMORY_ENV`] to determine the pending-buffer
-    /// size. The redb spill file is **not** created here; it is opened lazily
-    /// on the first buffer overflow.
+    /// Reads [`crate::env::TX_MEMORY_ENV`] to determine the per-actor
+    /// pending-buffer ceiling. The redb spill file is **not** created here;
+    /// it is opened lazily on the first buffer overflow.
     ///
     /// # Errors
     ///
-    /// Returns an error only if [`crate::env::TX_MEMORY_ENV`] is set but
-    /// contains an unparseable value.
-    pub fn new() -> Result<Self> {
-        let max_pending = env::max_pending_from_env(ENTRY_MEM_BYTES, DEFAULT_MAX_PENDING)?;
+    /// Returns [`EngineError::EngineInitError`] if [`crate::env::TX_MEMORY_ENV`]
+    /// is set but contains an unparseable value.
+    pub fn new(budget: Arc<GlobalMemBudget>) -> Result<Self, EngineError> {
+        let max_pending = env::max_pending_from_env(ENTRY_MEM_BYTES, DEFAULT_MAX_PENDING)
+            .map_err(|e| EngineError::EngineInitError(e.to_string()))?;
+        budget.register_actor();
         Ok(Self {
             accounts: HashMap::new(),
             disputed: HashSet::new(),
             pending: IndexMap::new(),
             max_pending,
             spill: None,
+            budget,
         })
     }
 
@@ -328,8 +353,14 @@ impl Payments {
     /// client seen during processing.
     ///
     /// Row ordering is unspecified (matches the spec: "row ordering does not matter").
-    pub fn accounts(self) -> impl Iterator<Item = Account> {
-        self.accounts.into_values().map(|fsm| fsm.to_account())
+    pub fn accounts(mut self) -> impl Iterator<Item = Account> {
+        // `mem::take` leaves the field Default-initialised so the engine stays
+        // whole and its `Drop` impl (which releases the pending-buffer bytes
+        // back to the shared budget) can still run when `self` goes out of
+        // scope — moving a field out directly triggers E0509.
+        std::mem::take(&mut self.accounts)
+            .into_values()
+            .map(|fsm| fsm.to_account())
     }
 
     // -- Event handlers ------------------------------------------------------
@@ -348,6 +379,22 @@ impl Payments {
             return Ok(());
         }
 
+        // Reserve memory for this new entry. If we'd cross the global
+        // ceiling, flush once to free space and retry. If reservation still
+        // fails, other actors are holding all the memory and we have nothing
+        // left to flush locally — force the reservation so counters stay
+        // consistent and log, rather than drop a valid transaction.
+        if !self.budget.try_reserve(ENTRY_MEM_BYTES) {
+            self.flush_oldest()?;
+            if !self.budget.try_reserve(ENTRY_MEM_BYTES) {
+                self.budget.force_reserve(ENTRY_MEM_BYTES);
+                eprintln!(
+                    "tx {}: global memory budget exhausted; proceeding over limit",
+                    event.tx
+                );
+            }
+        }
+
         self.pending.insert(
             event.tx,
             DepositRecord {
@@ -357,10 +404,46 @@ impl Payments {
         );
         self.account_mut(event.client).apply_deposit(amount);
 
-        if self.pending.len() >= self.max_pending {
+        // Behavior B — adaptive post-insert flush. Under rising global
+        // pressure the effective threshold shrinks so every actor flushes
+        // earlier and contributes to freeing memory before the hard ceiling
+        // is hit.
+        if self.pending.len() >= self.effective_flush_threshold() {
             self.flush_oldest()?;
         }
+
         Ok(())
+    }
+
+    /// Post-insert flush threshold, in number of pending entries.
+    ///
+    /// The base cap is `min(max_pending, budget.suggested_per_actor_cap(...))`:
+    /// `max_pending` is the operator-configured upper bound; the suggested cap
+    /// is the global limit divided fairly across all live actors.  Taking the
+    /// minimum ensures the proactive flush fires at a level consistent with the
+    /// global budget regardless of how many clients are active, without needing
+    /// manual per-actor tuning.
+    ///
+    /// Pressure then scales the base cap downward:
+    ///
+    /// | Pressure | Threshold           | Rationale                                         |
+    /// |----------|---------------------|---------------------------------------------------|
+    /// | Low      | `base`              | Normal operation.                                 |
+    /// | Medium   | `base / 2`          | Spread I/O earlier; buy headroom before ceiling.  |
+    /// | High     | `max_pending`       | Pre-insert reservation retry already flushed; the |
+    /// |          |                     | post-insert check must not double-flush.           |
+    fn effective_flush_threshold(&self) -> usize {
+        // Fair per-actor share of the global budget, derived dynamically from
+        // the current actor count. Capped by the operator-set max_pending.
+        let per_actor = self.budget.suggested_per_actor_cap(ENTRY_MEM_BYTES);
+        let base = self.max_pending.min(per_actor);
+        match self.budget.pressure() {
+            MemPressure::Low => base,
+            MemPressure::Medium => (base / 2).max(1),
+            // At High pressure the pre-insert reservation retry path already
+            // flushed; using max_pending here avoids a redundant second flush.
+            MemPressure::High => self.max_pending,
+        }
     }
 
     fn handle_withdrawal(&mut self, event: TransactionInfo) -> Result<()> {
@@ -546,6 +629,11 @@ impl Payments {
             }
             txn.commit().context("failed to commit deposit batch")?;
         }
+
+        // Return the freed bytes to the shared budget so other actors (or
+        // this one on its next insert) can take them.
+        self.budget.release(flush_count * ENTRY_MEM_BYTES);
+
         Ok(())
     }
 
@@ -571,6 +659,23 @@ impl Payments {
         txn.commit()
             .context("failed to commit table initialisation")?;
         Ok(Spill { db, _tmp: tmp })
+    }
+}
+
+impl Drop for Payments {
+    /// Return every byte still held in `pending` to the shared budget and
+    /// decrement the live-actor count.
+    ///
+    /// Single-shot CSV runs drop the budget alongside the engine so the
+    /// counter dies with the process either way, but a clean release keeps
+    /// accounting honest for long-lived budgets (e.g. future interactive or
+    /// streaming deployments where the budget outlives individual actors).
+    fn drop(&mut self) {
+        let outstanding = self.pending.len().saturating_mul(ENTRY_MEM_BYTES);
+        if outstanding > 0 {
+            self.budget.release(outstanding);
+        }
+        self.budget.deregister_actor();
     }
 }
 
@@ -654,7 +759,7 @@ mod tests {
 
     /// Build an engine whose pending buffer holds at most `cap` entries.
     fn engine_with_cap(cap: usize) -> Payments {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.max_pending = cap;
         e
     }
@@ -695,7 +800,7 @@ mod tests {
 
     #[test]
     fn deposit_creates_account_and_credits_available() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
 
         let accounts = accounts_map(e);
@@ -708,7 +813,7 @@ mod tests {
 
     #[test]
     fn duplicate_tx_id_is_ignored() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(deposit(1, 1, dec!(50.0000))).unwrap(); // same tx ID
 
@@ -720,7 +825,7 @@ mod tests {
 
     #[test]
     fn withdrawal_debits_available() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(withdrawal(1, 2, dec!(40.0000))).unwrap();
 
@@ -731,7 +836,7 @@ mod tests {
 
     #[test]
     fn withdrawal_fails_silently_on_insufficient_funds() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(10.0000))).unwrap();
         e.apply(withdrawal(1, 2, dec!(20.0000))).unwrap(); // exceeds available
 
@@ -743,7 +848,7 @@ mod tests {
 
     #[test]
     fn dispute_moves_funds_to_held() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(dispute(1, 1)).unwrap();
 
@@ -756,7 +861,7 @@ mod tests {
 
     #[test]
     fn dispute_with_insufficient_available_is_ignored() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(100.0))).unwrap();
         e.apply(withdrawal(1, 2, dec!(100.0))).unwrap(); // drain available
         e.apply(dispute(1, 1)).unwrap(); // available < deposit amount → ignored
@@ -770,7 +875,7 @@ mod tests {
 
     #[test]
     fn dispute_unknown_tx_is_ignored() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(dispute(1, 99)).unwrap(); // tx 99 does not exist
 
@@ -781,7 +886,7 @@ mod tests {
 
     #[test]
     fn dispute_cross_client_is_ignored() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(dispute(2, 1)).unwrap(); // client 2 tries to dispute client 1's tx
 
@@ -792,7 +897,7 @@ mod tests {
 
     #[test]
     fn dispute_idempotency() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(dispute(1, 1)).unwrap();
         e.apply(dispute(1, 1)).unwrap(); // duplicate dispute
@@ -807,7 +912,7 @@ mod tests {
 
     #[test]
     fn resolve_moves_held_back_to_available() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(dispute(1, 1)).unwrap();
         e.apply(resolve(1, 1)).unwrap();
@@ -821,7 +926,7 @@ mod tests {
 
     #[test]
     fn resolve_on_undisputed_tx_is_ignored() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(resolve(1, 1)).unwrap(); // not disputed
 
@@ -834,7 +939,7 @@ mod tests {
 
     #[test]
     fn chargeback_deducts_held_and_locks_account() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(dispute(1, 1)).unwrap();
         e.apply(chargeback(1, 1)).unwrap();
@@ -849,7 +954,7 @@ mod tests {
 
     #[test]
     fn chargeback_on_undisputed_tx_is_ignored() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(chargeback(1, 1)).unwrap(); // no prior dispute
 
@@ -860,7 +965,7 @@ mod tests {
 
     #[test]
     fn locked_account_ignores_all_mutations() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(dispute(1, 1)).unwrap();
         e.apply(chargeback(1, 1)).unwrap(); // locks the account
@@ -878,7 +983,7 @@ mod tests {
 
     #[test]
     fn multiple_clients_are_independent() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(100.0000))).unwrap();
         e.apply(deposit(2, 2, dec!(200.0000))).unwrap();
         e.apply(withdrawal(1, 3, dec!(50.0000))).unwrap();
@@ -892,7 +997,7 @@ mod tests {
 
     #[test]
     fn deposit_without_amount_returns_err() {
-        let mut e = Payments::new().unwrap();
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         let result = e.apply(TransactionInfo {
             type_tx: TransactionType::Deposit,
             client: 1,
@@ -900,5 +1005,108 @@ mod tests {
             amount: None,
         });
         assert!(result.is_err());
+    }
+
+    // -- Global memory budget -----------------------------------------------
+
+    #[test]
+    fn budget_tracks_bytes_held_in_pending() {
+        let budget = Arc::new(GlobalMemBudget::unlimited());
+        let mut e = Payments::new(budget.clone()).unwrap();
+        e.apply(deposit(1, 1, dec!(1.0))).unwrap();
+        e.apply(deposit(1, 2, dec!(2.0))).unwrap();
+        assert_eq!(budget.in_use(), ENTRY_MEM_BYTES * 2);
+    }
+
+    #[test]
+    fn budget_released_when_engine_dropped() {
+        let budget = Arc::new(GlobalMemBudget::unlimited());
+        {
+            let mut e = Payments::new(budget.clone()).unwrap();
+            e.apply(deposit(1, 1, dec!(1.0))).unwrap();
+            e.apply(deposit(1, 2, dec!(2.0))).unwrap();
+            assert_eq!(budget.in_use(), ENTRY_MEM_BYTES * 2);
+        } // engine dropped here
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    #[test]
+    fn budget_released_on_flush() {
+        let budget = Arc::new(GlobalMemBudget::unlimited());
+        let mut e = Payments::new(budget.clone()).unwrap();
+        for tx in 1..=5u32 {
+            e.apply(deposit(1, tx, dec!(1.0))).unwrap();
+        }
+        let before = budget.in_use();
+        e.flush_oldest().unwrap();
+        assert!(
+            budget.in_use() < before,
+            "flush must release bytes to the budget"
+        );
+    }
+
+    #[test]
+    fn high_pressure_forces_flush_before_each_insert() {
+        // Budget capped at exactly 2 entries' worth — the third insert is
+        // forced to flush before it can reserve.
+        let budget = Arc::new(GlobalMemBudget::new(ENTRY_MEM_BYTES * 2));
+        let mut e = Payments::new(budget.clone()).unwrap();
+        e.max_pending = usize::MAX; // disable per-actor cap so only the budget bites
+
+        e.apply(deposit(1, 1, dec!(1.0))).unwrap();
+        e.apply(deposit(1, 2, dec!(2.0))).unwrap();
+        // Budget is now saturated; next insert must spill.
+        e.apply(deposit(1, 3, dec!(3.0))).unwrap();
+
+        assert!(e.spill.is_some(), "spill file must have been created");
+        assert!(
+            budget.in_use() <= ENTRY_MEM_BYTES * 2,
+            "budget must stay within its hard ceiling under High pressure",
+        );
+    }
+
+    #[test]
+    fn effective_flush_threshold_adapts_to_pressure() {
+        // Budget holds 10 entries total; 1 actor registered by Payments::new.
+        // suggested_per_actor_cap = 10. max_pending = 20 → base = min(20, 10) = 10.
+        let budget = Arc::new(GlobalMemBudget::new(ENTRY_MEM_BYTES * 10));
+        let mut e = Payments::new(budget.clone()).unwrap();
+        e.max_pending = 20;
+
+        // Low pressure: threshold = base = min(max_pending, per_actor_cap) = 10.
+        assert_eq!(budget.pressure(), MemPressure::Low);
+        assert_eq!(e.effective_flush_threshold(), 10);
+
+        // Medium pressure (≥ 80 % of hard limit): threshold halves to 5.
+        budget.force_reserve(ENTRY_MEM_BYTES * 8);
+        assert_eq!(budget.pressure(), MemPressure::Medium);
+        assert_eq!(e.effective_flush_threshold(), 5);
+
+        // High pressure (≥ hard limit): falls back to max_pending (20). The
+        // reservation retry path inside `handle_deposit` already flushed
+        // before the insert; the post-insert check must not double-flush.
+        budget.force_reserve(ENTRY_MEM_BYTES * 2);
+        assert_eq!(budget.pressure(), MemPressure::High);
+        assert_eq!(e.effective_flush_threshold(), 20);
+
+        // Restore the counter so the engine's Drop does not underflow.
+        budget.release(ENTRY_MEM_BYTES * 10);
+    }
+
+    #[test]
+    fn effective_flush_threshold_shrinks_as_actors_join() {
+        // Budget holds 100 entries.
+        let budget = Arc::new(GlobalMemBudget::new(ENTRY_MEM_BYTES * 100));
+
+        let e1 = Payments::new(budget.clone()).unwrap(); // actor_count = 1, cap = 100
+        assert_eq!(e1.effective_flush_threshold(), 100); // min(50M, 100) = 100
+
+        let e2 = Payments::new(budget.clone()).unwrap(); // actor_count = 2, cap = 50 each
+        assert_eq!(e2.effective_flush_threshold(), 50); // min(50M, 50) = 50
+        // e1's threshold also shrinks when recomputed — cap is live, not cached.
+        assert_eq!(e1.effective_flush_threshold(), 50);
+
+        drop(e2); // actor_count → 1; cap returns to 100
+        assert_eq!(e1.effective_flush_threshold(), 100);
     }
 }
