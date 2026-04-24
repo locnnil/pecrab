@@ -176,3 +176,15 @@ Found 9 outliers among 100 measurements (9.00%)
   4 (4.00%) high severe
 ```
 
+#### Testing parallelized version
+
+To be able to test the parallelized version, for more realistic scenarios (since it's very unlikely to handle a stream of transaction coming from a single client), a script was created to generate samples for deposits coming from multiple clients.
+So far, it's only possible to generate deposit samples using this script, but it's good enough to test the parallelization under certain loads.
+The other limitation that this script has is that, in order for the transactions to be in a random order, it uses [shuf](https://man7.org/linux/man-pages/man1/shuf.1.html), which needs to load all rows in memory, to then generate the shuffled output.
+
+A sample with 65535 clients with 1k transactions for each be generated using the command:
+```bash
+./tests/generate_sample.sh 14_max_clients 65535 1000
+```
+
+When testing it, the total time taken was 1:26.60, for a total of 65535000 transactions, which means a throughput of 756755.2 transactions per second.
