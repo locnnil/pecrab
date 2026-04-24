@@ -102,7 +102,7 @@ fi
 # Setup
 num_prefix="${name%%_*}"
 if [[ ! $num_prefix =~ ^[0-9]+$ ]]; then
-  exit_error "Invalid number prefix for sample name: $num_prefix"
+  exit_error "Invalid number prefix for sample name: $num_prefix; expected: <number>_<description>"
 fi
 
 input_file="$DATA_DIR/sample_${name}.csv"
