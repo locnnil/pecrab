@@ -79,26 +79,30 @@ pecrab_engine/sample_05   time: [1.05 ms]   thrpt: [347 KiB/s]
 
 ### Generation 5 — Global Memory Budget with Soft/Hard Watermarks (Current)
 
-With N actors each holding up to `PECRAB_ACTOR_MEMORY_LIMIT_BYTES` in memory, the aggregate
-footprint can reach N × per-actor limit; easily exceeding physical RAM with the full u16 client
-space (65 535 clients). The OOM problem reappeared at the actor-pool level.
+With N actors each holding a static per-actor limit in memory, the aggregate footprint can
+reach N × per-actor limit — easily exceeding physical RAM with the full u16 client space
+(65 535 clients). The OOM problem reappeared at the actor-pool level.
 
 A shared `GlobalMemBudget` counter (a single `AtomicUsize`) was introduced. Before inserting a
 deposit into its local `IndexMap`, every actor reserves the entry's memory cost from the global
-budget; on flush it releases the bytes. This keeps the aggregate ceiling bounded regardless of
-how many actors are active.
+budget; on flush it releases the bytes. Each actor's post-insert flush threshold is computed
+dynamically as `global_limit / actor_count / entry_size`, so the sum of all in-memory buffers
+stays within the hard ceiling regardless of how many clients are active. The threshold shrinks
+automatically as new actors are spawned and grows back when actors exit.
 
 To avoid all actors racing to flush at the same instant when the budget is nearly full, a
 three-level pressure model drives adaptive flush thresholds:
 
-| Pressure | Condition                 | Actor response                                    |
-|----------|---------------------------|---------------------------------------------------|
-| Low      | `used < 80 %` of limit    | Flush only when the per-actor cap is reached.     |
-| Medium   | `80 % ≤ used < 100 %`     | Flush preemptively at half per-actor capacity.    |
-| High     | `used ≥ 100 %` of limit   | Flush immediately before each insert.             |
+| Pressure | Condition                 | Actor response                                        |
+|----------|---------------------------|-------------------------------------------------------|
+| Low      | `used < 80 %` of limit    | Flush when the per-actor fair share is reached.       |
+| Medium   | `80 % ≤ used < 100 %`     | Flush preemptively at half the per-actor fair share.  |
+| High     | `used ≥ 100 %` of limit   | Flush immediately before each insert (pre-insert).    |
 
 The soft watermark (default 80 %) is configurable in basis points. This ramps up pressure
 gradually, spreading flush work across actors and keeping peak disk I/O bounded.
+
+The single tunable is `PECRAB_GLOBAL_MEMORY_LIMIT` (default 2 GB); there is no per-actor knob.
 
 ---
 

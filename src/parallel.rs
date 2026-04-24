@@ -32,13 +32,14 @@
 //!
 //! # Memory
 //!
-//! [`Payments::new`] reads [`crate::env::TX_MEMORY_ENV`] to size its local
-//! pending buffer — the *per-actor* ceiling. To prevent the sum of those
-//! ceilings from dwarfing RAM when thousands of clients are active, every
-//! actor shares a single [`GlobalMemBudget`] sized by
-//! [`crate::env::GLOBAL_MEMORY_ENV`]. The dispatcher constructs the budget
-//! once and hands each actor a clone of the `Arc`; every pending-buffer
-//! insertion reserves against it and every flush releases the bytes drained.
+//! Every actor shares a single [`GlobalMemBudget`] sized by
+//! [`crate::env::GLOBAL_MEMORY_ENV`] (default 2 GB). The dispatcher
+//! constructs the budget once and hands each actor a clone of the `Arc`.
+//! Each actor's post-insert flush threshold is derived live as
+//! `global_limit / actor_count / entry_size`, so the sum of all in-memory
+//! buffers stays within the hard ceiling regardless of how many clients are
+//! active. Every pending-buffer insertion reserves against the budget and
+//! every flush releases the bytes drained.
 //!
 //! The redb spill file remains lazy and per-actor — only actors that actually
 //! overflow their buffer touch disk.

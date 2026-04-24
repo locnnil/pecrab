@@ -81,12 +81,15 @@ PECRAB_LEDGER_DIR=/mnt/nvme/scratch cargo run --release -- transactions.csv > ac
 
 ### Memory Budget and Pressure Watermarks
 
-Two environment variables control memory usage:
+One environment variable controls memory usage:
 
-| Variable                      | Default | Description                                                    |
-|-------------------------------|---------|----------------------------------------------------------------|
-| `PECRAB_ACTOR_MEMORY_LIMIT_BYTES` | *(internal default)* | Per-actor in-memory cache budget. Accepts SI suffixes: `256M`, `1G`, etc. |
-| `PECRAB_GLOBAL_MEMORY_LIMIT`  | `2G`    | Aggregate budget across all actors. Prevents N actors × per-actor limit from exceeding physical RAM. |
+| Variable                     | Default | Description                                                                   |
+|------------------------------|---------|-------------------------------------------------------------------------------|
+| `PECRAB_GLOBAL_MEMORY_LIMIT` | `2G`    | Aggregate in-memory budget across all actors. Accepts SI suffixes: `500M`, `4G`, etc. |
+
+Each actor's flush threshold is computed dynamically as
+`PECRAB_GLOBAL_MEMORY_LIMIT / active_actor_count / entry_size`, so the sum of all
+in-memory buffers stays within the limit regardless of how many clients are active.
 
 The global budget uses a **soft/hard watermark** system to smooth out burst disk I/O:
 

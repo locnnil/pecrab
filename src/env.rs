@@ -43,18 +43,8 @@ pub fn resolve_ledger_dir() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Pending-buffer configuration
+// SI byte parsing (shared by global memory budget)
 // ---------------------------------------------------------------------------
-
-/// Environment variable that controls the memory budget for the pending deposit buffer.
-///
-/// Accepts a byte count with an optional SI suffix (powers of 1 000, not 1 024):
-/// `"512"` (bytes), `"256K"` / `"256KB"`, `"500M"` / `"500MB"`,
-/// `"1G"` / `"1GB"`, `"2T"` / `"2TB"`. Suffixes are case-insensitive.
-///
-/// When unset the engine falls back to the `default` passed to
-/// [`max_pending_from_env`].
-pub const TX_MEMORY_ENV: &str = "PECRAB_ACTOR_MEMORY_LIMIT_BYTES";
 
 /// Parse a human-readable byte count with an optional SI suffix.
 ///
@@ -98,34 +88,6 @@ pub fn parse_si_bytes(s: &str) -> Result<u64> {
     value
         .checked_mul(multiplier)
         .context("byte value overflows u64")
-}
-
-/// Read [`TX_MEMORY_ENV`] and compute the maximum number of pending entries.
-///
-/// Divides the configured byte budget by `entry_size` (the memory cost of one
-/// key-value pair in the pending buffer, computed by the caller with
-/// `size_of`). Falls back to `default` when the variable is unset. Always
-/// returns at least 1.
-///
-/// # Errors
-///
-/// Returns an error if the variable is set but cannot be parsed.
-pub fn max_pending_from_env(entry_size: usize, default: usize) -> Result<usize> {
-    let bytes = match std::env::var(TX_MEMORY_ENV) {
-        Ok(val) => parse_si_bytes(&val)
-            .with_context(|| format!("failed to parse {TX_MEMORY_ENV}={val:?}"))?,
-        Err(std::env::VarError::NotPresent) => return Ok(default),
-        Err(std::env::VarError::NotUnicode(s)) => {
-            bail!("{TX_MEMORY_ENV} is not valid UTF-8: {s:?}")
-        }
-    };
-
-    let max: usize = (bytes / entry_size as u64)
-        .try_into()
-        .context("computed max_pending overflows usize")?;
-
-    // Guard against a budget so small that the engine flushes on every deposit.
-    Ok(max.max(1))
 }
 
 // ---------------------------------------------------------------------------

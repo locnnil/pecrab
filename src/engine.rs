@@ -7,13 +7,13 @@
 //!
 //! ## Storage
 //! Deposits are held in an insertion-ordered in-memory buffer ([`IndexMap`]).
-//! When the buffer first reaches `max_pending` entries a temporary [`redb`]
-//! database is created **lazily** and the oldest 10 % are evicted to it.
-//! Subsequent overflows reuse the same file. This bounds heap usage to
-//! `max_pending` entries — allowing the full u32 transaction-ID space to be
-//! processed — while paying zero disk cost for engines that stay within the
-//! memory budget. Commits use [`Durability::None`] (no fsync) because the
-//! backing file is ephemeral and crash recovery is not required.
+//! When the buffer reaches the actor's fair share of the global budget a
+//! temporary [`redb`] database is created **lazily** and the oldest 10 % of
+//! entries are evicted to it. Subsequent overflows reuse the same file. This
+//! bounds heap usage — allowing the full u32 transaction-ID space to be
+//! processed — while paying zero disk cost for actors that stay within budget.
+//! Commits use [`Durability::None`] (no fsync) because the backing file is
+//! ephemeral and crash recovery is not required.
 //!
 //! ## Event sourcing
 //! Every [`TransactionInfo`] that arrives is an immutable event. The engine never
@@ -43,19 +43,19 @@
 //!
 //! ## Pending-buffer eviction
 //! Deposits are buffered in an [`IndexMap`] (insertion-ordered). When the buffer
-//! reaches `max_pending` entries — derived from [`TX_MEMORY_ENV`] at startup —
-//! the **oldest 10 %** are evicted to the lazily-created redb file in a single
+//! reaches the actor's fair share of the global budget — computed dynamically by
+//! [`crate::mem_budget::GlobalMemBudget::suggested_per_actor_cap`] — the
+//! **oldest 10 %** are evicted to the lazily-created redb file in a single
 //! write transaction. The remaining 90 % stay in memory so recent deposits remain
 //! fast to look up. Dispute / resolve / chargeback handlers always check the
 //! in-memory buffer first, then fall through to the on-disk ledger.
 //!
 //! ## Aggregate memory budget
-//! `max_pending` caps a *single* actor. With thousands of clients, the sum of
-//! per-actor ceilings can dwarf physical RAM. A shared
-//! [`crate::mem_budget::GlobalMemBudget`] — passed in via [`Payments::new`] —
-//! tracks the aggregate bytes held across every actor and refuses reservations
-//! that would cross the hard ceiling. Under elevated pressure actors flush
-//! preemptively (Behavior B) so the ceiling is rarely hit at all.
+//! Each actor's flush threshold is `global_limit / actor_count / ENTRY_MEM_BYTES`,
+//! derived live from [`crate::mem_budget::GlobalMemBudget`] on every insert. As new
+//! clients spawn more actors the threshold shrinks automatically, so the sum of
+//! all in-memory buffers never exceeds the hard ceiling. Under elevated pressure
+//! actors flush preemptively (Behavior B) so the ceiling is rarely hit at all.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -66,7 +66,6 @@ use redb::{Database, Durability, ReadableDatabase, TableDefinition};
 use rust_decimal::Decimal;
 use tempfile::{Builder, NamedTempFile};
 
-use crate::env;
 use crate::env::resolve_ledger_dir;
 use crate::errors::EngineError;
 use crate::mem_budget::{GlobalMemBudget, MemPressure};
@@ -128,12 +127,6 @@ struct DepositRecord {
 /// peak RSS will be modestly higher. The formula gives operators a simple,
 /// predictable mental model when sizing [`crate::env::TX_MEMORY_ENV`].
 const ENTRY_MEM_BYTES: usize = std::mem::size_of::<u32>() + std::mem::size_of::<DepositRecord>();
-
-/// Default pending-buffer entry cap when [`TX_MEMORY_ENV`] is unset.
-///
-/// Matches the legacy hard-coded batch size so existing deployments that do not
-/// set the environment variable see no behaviour change.
-const DEFAULT_MAX_PENDING: usize = 50_000_000;
 
 /// Per-account state machine.
 ///
@@ -286,15 +279,6 @@ pub struct Payments {
     /// remaining 90 % stay in memory.
     pending: IndexMap<u32, DepositRecord>,
 
-    /// Hard upper bound on entries allowed in `pending` for this actor.
-    ///
-    /// Computed from [`crate::env::TX_MEMORY_ENV`] at startup. Serves as a
-    /// ceiling: the *effective* post-insert flush threshold is
-    /// `min(max_pending, budget.suggested_per_actor_cap(ENTRY_MEM_BYTES))`,
-    /// so the global memory budget — divided fairly across all live actors —
-    /// is always the binding constraint when many clients are active.
-    pub(crate) max_pending: usize,
-
     /// Lazily-created redb spill. `None` until the first buffer overflow.
     spill: Option<Spill>,
 
@@ -319,14 +303,11 @@ impl Payments {
     /// Returns [`EngineError::EngineInitError`] if [`crate::env::TX_MEMORY_ENV`]
     /// is set but contains an unparseable value.
     pub fn new(budget: Arc<GlobalMemBudget>) -> Result<Self, EngineError> {
-        let max_pending = env::max_pending_from_env(ENTRY_MEM_BYTES, DEFAULT_MAX_PENDING)
-            .map_err(|e| EngineError::EngineInitError(e.to_string()))?;
         budget.register_actor();
         Ok(Self {
             accounts: HashMap::new(),
             disputed: HashSet::new(),
             pending: IndexMap::new(),
-            max_pending,
             spill: None,
             budget,
         })
@@ -417,32 +398,23 @@ impl Payments {
 
     /// Post-insert flush threshold, in number of pending entries.
     ///
-    /// The base cap is `min(max_pending, budget.suggested_per_actor_cap(...))`:
-    /// `max_pending` is the operator-configured upper bound; the suggested cap
-    /// is the global limit divided fairly across all live actors.  Taking the
-    /// minimum ensures the proactive flush fires at a level consistent with the
-    /// global budget regardless of how many clients are active, without needing
-    /// manual per-actor tuning.
+    /// The cap is `budget.suggested_per_actor_cap(ENTRY_MEM_BYTES)` — the
+    /// global limit divided fairly across all live actors — so the proactive
+    /// flush always fires at a level consistent with the global budget,
+    /// adapting automatically as the actor pool grows or shrinks.
     ///
-    /// Pressure then scales the base cap downward:
-    ///
-    /// | Pressure | Threshold           | Rationale                                         |
-    /// |----------|---------------------|---------------------------------------------------|
-    /// | Low      | `base`              | Normal operation.                                 |
-    /// | Medium   | `base / 2`          | Spread I/O earlier; buy headroom before ceiling.  |
-    /// | High     | `max_pending`       | Pre-insert reservation retry already flushed; the |
-    /// |          |                     | post-insert check must not double-flush.           |
+    /// | Pressure | Threshold      | Rationale                                               |
+    /// |----------|----------------|---------------------------------------------------------|
+    /// | Low      | `per_actor`    | Normal operation.                                       |
+    /// | Medium   | `per_actor / 2`| Spread I/O earlier; buy headroom before the ceiling.    |
+    /// | High     | `usize::MAX`   | Pre-insert reservation retry already flushed; skip the  |
+    /// |          |                | post-insert check to avoid a redundant second flush.    |
     fn effective_flush_threshold(&self) -> usize {
-        // Fair per-actor share of the global budget, derived dynamically from
-        // the current actor count. Capped by the operator-set max_pending.
         let per_actor = self.budget.suggested_per_actor_cap(ENTRY_MEM_BYTES);
-        let base = self.max_pending.min(per_actor);
         match self.budget.pressure() {
-            MemPressure::Low => base,
-            MemPressure::Medium => (base / 2).max(1),
-            // At High pressure the pre-insert reservation retry path already
-            // flushed; using max_pending here avoids a redundant second flush.
-            MemPressure::High => self.max_pending,
+            MemPressure::Low => per_actor,
+            MemPressure::Medium => (per_actor / 2).max(1),
+            MemPressure::High => usize::MAX,
         }
     }
 
@@ -755,22 +727,26 @@ mod tests {
         engine.accounts().map(|a| (a.client, a)).collect()
     }
 
-    // -- flush_oldest (via small max_pending) --------------------------------
+    // -- flush_oldest --------------------------------------------------------
 
-    /// Build an engine whose pending buffer holds at most `cap` entries.
+    /// Build an engine whose budget allows at most `cap` entries.
+    ///
+    /// The (`cap` + 1)-th deposit fails `try_reserve` and triggers the
+    /// pre-insert flush path.
     fn engine_with_cap(cap: usize) -> Payments {
-        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
-        e.max_pending = cap;
-        e
+        let budget = Arc::new(GlobalMemBudget::new(cap * ENTRY_MEM_BYTES));
+        Payments::new(budget).unwrap()
     }
 
     #[test]
     fn flush_oldest_evicts_to_redb_and_deposit_still_disputable() {
-        // cap=1 so the very first deposit triggers an immediate flush.
+        // cap=1: a second deposit exhausts the budget, triggering a pre-insert
+        // flush that moves tx 1 to redb before tx 2 is inserted.
         let mut e = engine_with_cap(1);
-        e.apply(deposit(1, 1, dec!(100.0))).unwrap();
+        e.apply(deposit(1, 1, dec!(100.0))).unwrap(); // fills the budget
+        e.apply(deposit(1, 2, dec!(1.0))).unwrap(); // pre-insert flush: tx 1 → redb
 
-        // After flush, tx 1 must be findable via the on-disk ledger.
+        // tx 1 must be findable via the on-disk ledger.
         e.apply(dispute(1, 1)).unwrap();
 
         let accounts = accounts_map(e);
@@ -779,16 +755,19 @@ mod tests {
 
     #[test]
     fn flush_oldest_keeps_newer_entries_in_memory() {
-        // cap=2: filling to 2 flushes 1 (10 % rounded up), keeping 1 in memory.
-        let mut e = engine_with_cap(2);
+        // Use an unlimited budget and call flush_oldest directly to isolate the
+        // eviction policy: oldest 10 % are drained, newest stay in memory.
+        let mut e = Payments::new(Arc::new(GlobalMemBudget::unlimited())).unwrap();
         e.apply(deposit(1, 1, dec!(10.0))).unwrap();
-        e.apply(deposit(1, 2, dec!(20.0))).unwrap(); // triggers flush of tx 1
+        e.apply(deposit(1, 2, dec!(20.0))).unwrap();
 
-        // tx 1 must be in redb now; tx 2 must still be in pending.
+        e.flush_oldest().unwrap();
+
+        // Oldest entry (tx 1) should be in redb; newest (tx 2) stays in pending.
         assert!(!e.pending.contains_key(&1));
         assert!(e.pending.contains_key(&2));
 
-        // Both deposits must still be disputable.
+        // Both must still be disputable.
         e.apply(dispute(1, 1)).unwrap();
         e.apply(dispute(1, 2)).unwrap();
 
@@ -1051,7 +1030,6 @@ mod tests {
         // forced to flush before it can reserve.
         let budget = Arc::new(GlobalMemBudget::new(ENTRY_MEM_BYTES * 2));
         let mut e = Payments::new(budget.clone()).unwrap();
-        e.max_pending = usize::MAX; // disable per-actor cap so only the budget bites
 
         e.apply(deposit(1, 1, dec!(1.0))).unwrap();
         e.apply(deposit(1, 2, dec!(2.0))).unwrap();
@@ -1067,13 +1045,11 @@ mod tests {
 
     #[test]
     fn effective_flush_threshold_adapts_to_pressure() {
-        // Budget holds 10 entries total; 1 actor registered by Payments::new.
-        // suggested_per_actor_cap = 10. max_pending = 20 → base = min(20, 10) = 10.
+        // Budget holds 10 entries total; 1 actor → suggested_per_actor_cap = 10.
         let budget = Arc::new(GlobalMemBudget::new(ENTRY_MEM_BYTES * 10));
-        let mut e = Payments::new(budget.clone()).unwrap();
-        e.max_pending = 20;
+        let e = Payments::new(budget.clone()).unwrap();
 
-        // Low pressure: threshold = base = min(max_pending, per_actor_cap) = 10.
+        // Low pressure: threshold = per_actor_cap = 10.
         assert_eq!(budget.pressure(), MemPressure::Low);
         assert_eq!(e.effective_flush_threshold(), 10);
 
@@ -1082,12 +1058,10 @@ mod tests {
         assert_eq!(budget.pressure(), MemPressure::Medium);
         assert_eq!(e.effective_flush_threshold(), 5);
 
-        // High pressure (≥ hard limit): falls back to max_pending (20). The
-        // reservation retry path inside `handle_deposit` already flushed
-        // before the insert; the post-insert check must not double-flush.
+        // High pressure: post-insert check is skipped (pre-insert retry handles it).
         budget.force_reserve(ENTRY_MEM_BYTES * 2);
         assert_eq!(budget.pressure(), MemPressure::High);
-        assert_eq!(e.effective_flush_threshold(), 20);
+        assert_eq!(e.effective_flush_threshold(), usize::MAX);
 
         // Restore the counter so the engine's Drop does not underflow.
         budget.release(ENTRY_MEM_BYTES * 10);
@@ -1099,11 +1073,11 @@ mod tests {
         let budget = Arc::new(GlobalMemBudget::new(ENTRY_MEM_BYTES * 100));
 
         let e1 = Payments::new(budget.clone()).unwrap(); // actor_count = 1, cap = 100
-        assert_eq!(e1.effective_flush_threshold(), 100); // min(50M, 100) = 100
+        assert_eq!(e1.effective_flush_threshold(), 100);
 
         let e2 = Payments::new(budget.clone()).unwrap(); // actor_count = 2, cap = 50 each
-        assert_eq!(e2.effective_flush_threshold(), 50); // min(50M, 50) = 50
-        // e1's threshold also shrinks when recomputed — cap is live, not cached.
+        assert_eq!(e2.effective_flush_threshold(), 50);
+        // e1's threshold also shrinks — cap is recomputed live, not cached.
         assert_eq!(e1.effective_flush_threshold(), 50);
 
         drop(e2); // actor_count → 1; cap returns to 100
