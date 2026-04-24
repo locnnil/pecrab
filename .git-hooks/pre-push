@@ -13,7 +13,7 @@ if ! git diff --quiet -- Cargo.lock; then
 fi
 
 # Format check (fast, should always pass), build, clippy, and tests.
-cargo fmt -- --check
+cargo fmt --all -- --check
 cargo build
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
